@@ -16,6 +16,13 @@ Uso:
     python evchargersim.py CARREGADOR_02 --url ws://192.168.15.18:9000
                                               (aponta pra um CSMS específico,
                                                 sem precisar editar o arquivo)
+    python evchargersim.py --config sim.json (carrega valores padrão de um
+                                                arquivo JSON — ver
+                                                SimConfig.FIELDS abaixo para
+                                                as chaves aceitas. Flags de
+                                                linha de comando, quando
+                                                passadas, sempre têm
+                                                prioridade sobre o arquivo.)
     python evchargersim.py --verbose         (mostra Heartbeat e
                                                 GetConfiguration no terminal
                                                 — por padrão ficam silenciosos
@@ -32,12 +39,11 @@ Se a conexão com o CSMS cair (ou ele ainda não estiver de pé), o
 simulador tenta reconectar automaticamente com backoff exponencial —
 não precisa reiniciar o script manualmente.
 
-Configurações editáveis estão no topo do arquivo (CONNECTOR_ID, intervalos,
-parâmetros de bateria etc).
-
 Comandos disponíveis no terminal durante a execução:
-    start <id_tag>   -> simula motorista passando RFID no totem (Authorize →
-                        StartTransaction), sem precisar de RemoteStart do CSMS
+    start <id_tag>   -> simula motorista passando RFID no totem (Authorize
+                        ou lista local, se o id_tag estiver nela → StartTransaction).
+                        Recusado se o conector estiver reservado para outro
+                        id_tag, Inoperative (ChangeAvailability), ou Faulted.
     stop             -> simula cliente encerrando sessão localmente
                         (cabo desconectado / botão no carro), Reason.ev_disconnected
     pause            -> simula carro pausando o carregamento (→ SuspendedEV)
@@ -49,14 +55,23 @@ Comandos disponíveis no terminal durante a execução:
     clear            -> limpa uma falha ativa, voltando para Available
                         (necessário depois de um "fault" para poder usar
                         "start" de novo)
+    datatransfer <vendor_id> [message_id] [data]
+                     -> envia um DataTransfer do charger para o CSMS
     help             -> lista todos os comandos
+
+Reserva (ReserveNow/CancelReservation), lista local de autorização
+(SendLocalList) e disponibilidade (ChangeAvailability) são controladas
+pelo CSMS via mensagens OCPP — "start" respeita todas automaticamente,
+sem comando de console dedicado para elas.
 """
 
 import argparse
 import asyncio
+import json
 import logging
 import random
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import websockets
@@ -67,118 +82,29 @@ from ocpp.v16.enums import (
     Action,
     AuthorizationStatus,
     AvailabilityStatus,
+    AvailabilityType,
+    CancelReservationStatus,
     ChargePointErrorCode,
     ChargePointStatus,
+    DataTransferStatus,
+    DiagnosticsStatus,
+    FirmwareStatus,
     Reason,
     RegistrationStatus,
     RemoteStartStopStatus,
+    ReservationStatus,
     ResetType,
+    UnlockStatus,
+    UpdateStatus,
 )
 
 # ============================================================
-# CONFIGURAÇÃO — ajuste conforme seu CSMS
+# CONFIGURAÇÃO — construída a partir de defaults + arquivo --config + CLI
 # ============================================================
-def _parse_args():
-    parser = argparse.ArgumentParser(
-        description="EVChargerSim — simulador standalone de Charge Point OCPP 1.6J.")
-    parser.add_argument(
-        "charge_point_id", nargs="?", default="EVCHARGERSIM_01",
-        help="ID do charge point (padrão: EVCHARGERSIM_01). Permite rodar "
-             "várias instâncias simultâneas, cada uma com seu próprio ID.")
-    parser.add_argument(
-        "--url", default="ws://localhost:9000",
-        help="URL base do CSMS, SEM o charge point ID no final "
-             "(padrão: ws://localhost:9000). O ID é sempre anexado "
-             "automaticamente ao conectar.")
-    parser.add_argument(
-        "--verbose", action="store_true",
-        help="Mostra Heartbeat e GetConfiguration no terminal (por padrão "
-             "ficam em nível DEBUG, silenciosos, já que repetem sem trazer "
-             "informação nova a cada ciclo). MeterValues aparece sempre, "
-             "independente desta flag.")
-    return parser.parse_args()
 
-
-_args = _parse_args()
-
-# CHARGE_POINT_ID e CSMS_URL vêm de linha de comando, permitindo rodar
-# múltiplas instâncias deste script simultaneamente (cada uma com seu
-# próprio ID e, se necessário, apontando pra um CSMS diferente) — sem
-# isso, duas instâncias tentariam usar o mesmo ID e colidiriam no CSMS,
-# ou precisariam editar o arquivo pra apontar pra outro servidor.
-CHARGE_POINT_ID = _args.charge_point_id
-CSMS_URL = _args.url
-VERBOSE = _args.verbose
-CONNECTOR_ID = 1                   # conector simulado (chargers AC residenciais tipicamente têm 1)
-
-# Intervalos em segundos — valores padrão típicos de chargers AC reais
-# (MeterValueSampleInterval=30, HeartbeatInterval varia por deployment).
-# Ajuste aqui se quiser um ciclo mais rápido para debug pontual.
-METER_VALUES_INTERVAL = 30
-HEARTBEAT_INTERVAL = 120  # padrao realista (deployments reais tipicamente
-                          # usam 30-300s; 120s e um meio-termo comum)
-
-# Corrente padrão aplicada assim que uma sessão começa, antes de qualquer
-# SetChargingProfile chegar do CSMS. Para carregadores AC residenciais:
-#   16A @ 225V ≈ 3.6 kW  → bateria de 50 kWh (20→100%) em ~10h (realista)
-#   32A @ 225V ≈ 7.2 kW  → mesma bateria em ~5h
-# SetChargingProfile do CSMS sobrescreve esse valor normalmente — isso só
-# garante que a sessão não fique parada em 0A esperando o perfil chegar.
-DEFAULT_OFFERED_AMPS = 16.0
-
-# Fator de aceleração da simulação. SIMULATION_SPEED = 1.0 é tempo real.
-# Use valores maiores para testes que não precisam esperar horas reais:
-#   6.0  → 1h de sessão simulada em 10min
-#   60.0 → bateria 20→100% em ~10min (com 16A)
-# Só afeta o acumulador de energia/SoC — heartbeat e MeterValues continuam
-# sendo enviados no intervalo real (comportamento OCPP não muda).
-SIMULATION_SPEED = 1.0
-
-# Corrente "real" que o carregador simulado está entregando neste momento.
-# Começa em 0 (sem carro) e é atualizada quando o CSMS manda SetChargingProfile.
-current_offered_amps = 0.0
-current_actual_amps = 0.0  # o que o "carro" simula estar de fato puxando
-
-# Estado de sessão/transação — necessário para StartTransaction/StopTransaction,
-# que são as mensagens que o CSMS usa para abrir/fechar sessão no banco de dados.
-active_transaction_id = None
-energy_meter_wh = 0.0  # contador de energia acumulada simulado (Wh)
-
-# Intervalo de heartbeat ATUAL — pode ser alterado em runtime via
-# ChangeConfiguration(key='HeartbeatInterval'). Separado da constante
-# HEARTBEAT_INTERVAL (que é só o valor inicial); send_heartbeat_loop
-# relê esta variável a cada ciclo, então a mudança tem efeito imediato.
-current_heartbeat_interval = HEARTBEAT_INTERVAL
-
-# ── SIMULAÇÃO DE BATERIA (SoC) ─────────────────────────────────────────
-# Em carregamento AC real, a corrente entregue não fica simplesmente fixa
-# em ~95% do limite oferecido a sessão inteira — ela cai conforme a
-# bateria se aproxima da carga completa ("tapering"), efeito visível
-# sobretudo acima de ~80% de SoC. Simulamos isso de forma simplificada:
-# um EV de bateria média (~50 kWh, ex: faixa de um VW ID.3/Nissan Leaf).
-BATTERY_CAPACITY_WH = 50_000.0
-INITIAL_SOC_PERCENT = 20.0   # toda sessão começa com 20% para testes
-                              # reproduzíveis. Mude aqui se quiser outro valor.
-battery_soc_percent = INITIAL_SOC_PERCENT
-
-# Flag de pausa — True enquanto o carro estiver em SuspendedEV.
-# O energy_accumulator_loop respeita esse flag e para de acumular.
-session_suspended = False
-
-# Flag distinta de session_suspended acima: True enquanto o CSMS estiver
-# impondo 0A via SetChargingProfile (ex: fila de espera do balanceamento
-# de site) — SuspendedEVSE, e não SuspendedEV. São duas causas de
-# suspensão diferentes (lado do carro vs. lado do equipamento) e cada
-# uma tem seu próprio status OCPP.
-evse_suspended_by_profile = False
-
-# True entre um comando "fault" e um "clear" — enquanto ativo, o console
-# recusa "start" (não faz sentido iniciar sessão num charger em Faulted)
-# até o operador limpar a falha explicitamente, espelhando um charger
-# físico real que não volta a Available sozinho após um erro de hardware.
-is_faulted = False
-
-# Mapa de nomes amigáveis (console) -> ChargePointErrorCode (OCPP).
+# Mapa de nomes amigáveis (console) -> ChargePointErrorCode (OCPP). Fica
+# fora do SimConfig porque é uma tabela fixa do protocolo, não um
+# parâmetro de simulação que faça sentido sobrescrever por instância.
 FAULT_CODE_MAP = {
     "ground_failure":         ChargePointErrorCode.ground_failure,
     "over_current_failure":   ChargePointErrorCode.over_current_failure,
@@ -189,17 +115,223 @@ FAULT_CODE_MAP = {
     "other_error":            ChargePointErrorCode.other_error,
 }
 
-# Tensão nominal de referência para os cálculos de potência/energia.
-# Faixa típica de rede monofásica/bifásica residencial (~220-230V). A
-# função read_grid_voltage() adiciona uma pequena variação em torno
-# desse valor para cada leitura, já que a rede elétrica real nunca fica
-# perfeitamente constante.
-NOMINAL_VOLTAGE = 225.0
+
+@dataclass
+class SimConfig:
+    """
+    Configuração de uma instância do simulador — tudo aqui é fixo depois
+    do boot (diferente de ChargerState, que muda a cada mensagem/comando).
+    Substituiu o antigo bloco de constantes soltas no topo do módulo:
+    antes, rodar duas instâncias com parâmetros diferentes (ex: baterias
+    de tamanhos distintos) exigia editar o arquivo ou duplicar o script;
+    agora é --config a.json / --config b.json, ou flags de linha de
+    comando pontuais.
+
+    Precedência de valores: CLI (quando a flag é passada) > arquivo JSON
+    (--config) > defaults abaixo.
+    """
+    charge_point_id: str = "EVCHARGERSIM_01"
+    url: str = "ws://localhost:9000"
+    verbose: bool = False
+    connector_id: int = 1
+
+    meter_values_interval: int = 30
+    heartbeat_interval: int = 120
+
+    default_offered_amps: float = 16.0
+    simulation_speed: float = 1.0
+
+    battery_capacity_wh: float = 50_000.0
+    initial_soc_percent: float = 20.0
+
+    nominal_voltage: float = 225.0
+
+    # Timeout para chamadas OCPP consideradas críticas (Start/StopTransaction).
+    # Sem isso, um CSMS que trava sem responder deixava o simulador
+    # pendurado num `await self.call(...)` para sempre — nenhuma exceção,
+    # nenhum log, só um "start"/"stop" que nunca completa. Ver
+    # _send_start_transaction / _send_stop_transaction.
+    call_timeout_seconds: float = 30.0
+
+    @classmethod
+    def load(cls, argv=None) -> "SimConfig":
+        """Monta a config final combinando defaults, --config e flags de CLI."""
+        args = _parse_args(argv)
+        cfg = cls()
+
+        if args.config:
+            try:
+                with open(args.config, "r", encoding="utf-8") as fh:
+                    overrides = json.load(fh)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise SystemExit(
+                    f"Não foi possível ler --config '{args.config}': {exc}"
+                )
+            unknown = set(overrides) - {f for f in cfg.__dataclass_fields__}
+            if unknown:
+                raise SystemExit(
+                    f"Chave(s) desconhecida(s) em '{args.config}': "
+                    f"{', '.join(sorted(unknown))}. Chaves válidas: "
+                    f"{', '.join(sorted(cfg.__dataclass_fields__))}"
+                )
+            for key, value in overrides.items():
+                setattr(cfg, key, value)
+
+        # Só sobrescreve com CLI o que foi de fato passado (valor != None
+        # nos argumentos opcionais) — senão o default do argparse sempre
+        # pisaria no valor vindo do --config.
+        cli_overrides = {
+            "charge_point_id": args.charge_point_id,
+            "url": args.url,
+            "connector_id": args.connector_id,
+            "meter_values_interval": args.meter_interval,
+            "heartbeat_interval": args.heartbeat_interval,
+            "default_offered_amps": args.default_amps,
+            "simulation_speed": args.sim_speed,
+            "battery_capacity_wh": args.battery_wh,
+            "initial_soc_percent": args.initial_soc,
+            "nominal_voltage": args.voltage,
+            "call_timeout_seconds": args.call_timeout,
+        }
+        for key, value in cli_overrides.items():
+            if value is not None:
+                setattr(cfg, key, value)
+        if args.verbose:
+            cfg.verbose = True
+
+        return cfg
 
 
-def read_grid_voltage() -> float:
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="EVChargerSim — simulador standalone de Charge Point OCPP 1.6J.")
+    parser.add_argument(
+        "charge_point_id", nargs="?", default=None,
+        help="ID do charge point (padrão: EVCHARGERSIM_01, ou o valor de "
+             "--config). Permite rodar várias instâncias simultâneas, cada "
+             "uma com seu próprio ID.")
+    parser.add_argument(
+        "--url", default=None,
+        help="URL base do CSMS, SEM o charge point ID no final "
+             "(padrão: ws://localhost:9000). O ID é sempre anexado "
+             "automaticamente ao conectar.")
+    parser.add_argument(
+        "--config", default=None,
+        help="Caminho para um arquivo JSON com valores de configuração "
+             "(ver SimConfig no topo do arquivo para as chaves aceitas). "
+             "Flags de linha de comando têm prioridade sobre o arquivo.")
+    parser.add_argument("--connector-id", type=int, default=None)
+    parser.add_argument("--meter-interval", type=int, default=None,
+                         help="Intervalo de MeterValues em segundos (padrão: 30).")
+    parser.add_argument("--heartbeat-interval", type=int, default=None,
+                         help="Intervalo inicial de Heartbeat em segundos (padrão: 120).")
+    parser.add_argument("--default-amps", type=float, default=None,
+                         help="Corrente aplicada ao iniciar sessão, antes do "
+                              "primeiro SetChargingProfile (padrão: 16.0).")
+    parser.add_argument("--sim-speed", type=float, default=None,
+                         help="Fator de aceleração da simulação de bateria/energia "
+                              "(padrão: 1.0 = tempo real; 60.0 = 60x mais rápido).")
+    parser.add_argument("--battery-wh", type=float, default=None,
+                         help="Capacidade da bateria simulada em Wh (padrão: 50000).")
+    parser.add_argument("--initial-soc", type=float, default=None,
+                         help="SoC inicial de cada sessão, em %% (padrão: 20.0).")
+    parser.add_argument("--voltage", type=float, default=None,
+                         help="Tensão nominal de referência em V (padrão: 225.0).")
+    parser.add_argument("--call-timeout", type=float, default=None,
+                         help="Timeout em segundos para chamadas críticas "
+                              "(Start/StopTransaction) ao CSMS (padrão: 30.0).")
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Mostra Heartbeat e GetConfiguration no terminal (por padrão "
+             "ficam em nível DEBUG, silenciosos, já que repetem sem trazer "
+             "informação nova a cada ciclo). MeterValues aparece sempre, "
+             "independente desta flag.")
+    return parser.parse_args(argv)
+
+
+@dataclass
+class ChargerState:
+    """
+    Estado de sessão/runtime de UM charge point simulado — tudo aqui muda
+    ao longo da execução (diferente de SimConfig, que é fixo após o
+    boot). Antes vivia como ~10 variáveis `global` soltas no módulo, o
+    que tornava impossível rodar duas instâncias de EVChargerSim no
+    mesmo processo (ex: um teste automatizado com vários chargers) sem
+    elas pisarem no estado umas das outras. Agora cada EVChargerSim tem
+    seu próprio `self.state`.
+    """
+    # Corrente "real" que o carregador simulado está entregando neste
+    # momento. Começa em 0 (sem carro) e é atualizada quando o CSMS manda
+    # SetChargingProfile.
+    current_offered_amps: float = 0.0
+    current_actual_amps: float = 0.0  # o que o "carro" simula estar de fato puxando
+
+    # Estado de sessão/transação — necessário para StartTransaction/
+    # StopTransaction, que são as mensagens que o CSMS usa para abrir/
+    # fechar sessão no banco de dados.
+    active_transaction_id: int | None = None
+    energy_meter_wh: float = 0.0  # contador de energia acumulada simulado (Wh)
+
+    # Intervalo de heartbeat ATUAL — pode ser alterado em runtime via
+    # ChangeConfiguration(key='HeartbeatInterval'). Separado do valor
+    # inicial em SimConfig.heartbeat_interval; send_heartbeat_loop relê
+    # este campo a cada ciclo, então a mudança tem efeito imediato.
+    current_heartbeat_interval: int = 120
+
+    # ── SIMULAÇÃO DE BATERIA (SoC) ─────────────────────────────────
+    battery_soc_percent: float = 20.0
+
+    # Flag de pausa — True enquanto o carro estiver em SuspendedEV.
+    # O energy_accumulator_loop respeita esse flag e para de acumular.
+    session_suspended: bool = False
+
+    # Flag distinta de session_suspended acima: True enquanto o CSMS
+    # estiver impondo 0A via SetChargingProfile (ex: fila de espera do
+    # balanceamento de site) — SuspendedEVSE, e não SuspendedEV. São
+    # duas causas de suspensão diferentes (lado do carro vs. lado do
+    # equipamento) e cada uma tem seu próprio status OCPP.
+    evse_suspended_by_profile: bool = False
+
+    # True entre um comando "fault" e um "clear" — enquanto ativo, o
+    # console recusa "start" (não faz sentido iniciar sessão num charger
+    # em Faulted) até o operador limpar a falha explicitamente,
+    # espelhando um charger físico real que não volta a Available
+    # sozinho após um erro de hardware.
+    is_faulted: bool = False
+
+    # ── RESERVA (ReserveNow / CancelReservation) ────────────────────
+    # Enquanto reservation_id não for None, "start" local só é aceito se
+    # o id_tag bater com reserved_for_id_tag (ou com reserved_parent_id_tag,
+    # quando o CSMS informou um grupo) — replica o comportamento real de
+    # um charger reservado recusar motoristas sem o RFID certo.
+    reservation_id: int | None = None
+    reserved_for_id_tag: str | None = None
+    reserved_parent_id_tag: str | None = None
+
+    # ── LISTA LOCAL DE AUTORIZAÇÃO (SendLocalList / GetLocalListVersion) ──
+    # Mapa id_tag -> status ("Accepted"/"Blocked"/"Expired"/"Invalid").
+    # Quando um id_tag está aqui, o fluxo de start local usa esse status
+    # diretamente em vez de chamar Authorize no CSMS — simula um charger
+    # capaz de autorizar localmente/offline com uma lista pré-carregada.
+    local_auth_list: dict = field(default_factory=dict)
+    local_list_version: int = 0
+
+    # ── DISPONIBILIDADE (ChangeAvailability) ────────────────────────
+    # "Operative" (padrão) ou "Inoperative". Enquanto Inoperative, novas
+    # sessões (local ou remota) são recusadas — replica um operador
+    # marcando o conector fora de serviço no dashboard.
+    availability_status: str = "Operative"
+    # Guarda uma mudança para Inoperative pedida DURANTE uma sessão ativa
+    # — pelo spec OCPP, nesse caso a resposta deve ser "Scheduled" e a
+    # mudança só é aplicada de fato quando a sessão termina (não dá pra
+    # tirar o conector de operação com o carro ainda carregando).
+    pending_availability_change: str | None = None
+
+
+def read_grid_voltage(nominal_voltage: float) -> float:
     """Simula pequena flutuação natural da tensão de rede (~±1.5V)."""
-    return round(NOMINAL_VOLTAGE + random.uniform(-1.5, 1.5), 1)
+    return round(nominal_voltage + random.uniform(-1.5, 1.5), 1)
+
 
 class _ColorFormatter(logging.Formatter):
     """
@@ -260,27 +392,35 @@ class _ColorFormatter(logging.Formatter):
         )
 
 
-_USE_COLOR = sys.stdout.isatty()
+def build_logger(charge_point_id: str, verbose: bool) -> logging.Logger:
+    """
+    Cria o logger deste módulo. Extraído para uma função (em vez de
+    código solto no nível do módulo) para que possa ser chamado depois
+    que SimConfig.load() souber o charge_point_id e a flag --verbose —
+    antes, essas duas coisas eram lidas de _parse_args() direto no
+    escopo do módulo, o que amarrava a configuração de logging à
+    existência de argumentos globais de CLI.
+    """
+    use_color = sys.stdout.isatty()
+    handler = logging.StreamHandler()
+    handler.setFormatter(_ColorFormatter(
+        datefmt="%H:%M:%S",
+        charge_point_id=charge_point_id,
+        use_color=use_color,
+    ))
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO, handlers=[handler])
+    module_logger = logging.getLogger("evchargersim")
 
-_handler = logging.StreamHandler()
-_handler.setFormatter(_ColorFormatter(
-    datefmt="%H:%M:%S",
-    charge_point_id=CHARGE_POINT_ID,
-    use_color=_USE_COLOR,
-))
-logging.basicConfig(level=logging.DEBUG if VERBOSE else logging.INFO, handlers=[_handler])
-logger = logging.getLogger("evchargersim")
-
-# A biblioteca ocpp loga CADA mensagem OCPP crua (send/receive, JSON
-# completo) no logger "ocpp" em nível INFO — é isso que produz aqueles
-# blocos gigantes de JSON quebrados em várias linhas no terminal,
-# atropelando os logs legíveis deste script (ex: as linhas verdes de
-# MeterValues). Subindo para WARNING, só erros/CALLError da lib
-# aparecem; o tráfego OCPP completo continua sendo processado
-# normalmente, só não é mais IMPRESSO. O mesmo já é feito do lado do
-# CSMS real (ver dashboard_serverEV.py: install_log_handler()).
-logging.getLogger("ocpp").setLevel(logging.WARNING)
-logging.getLogger("websockets").setLevel(logging.WARNING)
+    # A biblioteca ocpp loga CADA mensagem OCPP crua (send/receive, JSON
+    # completo) no logger "ocpp" em nível INFO — é isso que produz aqueles
+    # blocos gigantes de JSON quebrados em várias linhas no terminal,
+    # atropelando os logs legíveis deste script (ex: as linhas verdes de
+    # MeterValues). Subindo para WARNING, só erros/CALLError da lib
+    # aparecem; o tráfego OCPP completo continua sendo processado
+    # normalmente, só não é mais IMPRESSO.
+    logging.getLogger("ocpp").setLevel(logging.WARNING)
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    return module_logger
 
 
 def compute_actual_current(offered_amps: float, soc_percent: float) -> float:
@@ -292,6 +432,10 @@ def compute_actual_current(offered_amps: float, soc_percent: float) -> float:
     limite oferecido na maior parte da curva — a redução por tapering só
     fica perceptível perto do fim (SoC alto), quando o carregador de
     bordo do veículo reduz a corrente para proteger a bateria.
+
+    Função pura (sem estado global/de instância) de propósito — fácil de
+    testar isoladamente com unittest, sem precisar montar um EVChargerSim
+    inteiro. Ver test_evchargersim.py.
     """
     if offered_amps <= 0:
         return 0.0
@@ -317,7 +461,7 @@ def _soc_bar(soc_percent: float, width: int = 10) -> str:
     return f"[{'█' * filled}{'░' * (width - filled)}] {soc_percent:5.1f}%"
 
 
-def _meter_line_color(has_session: bool, suspended: bool, faulted: bool) -> str:
+def _meter_line_color(has_session: bool, suspended: bool, faulted: bool, use_color: bool) -> str:
     """
     Cor da linha de MeterValues conforme o estado atual do charger —
     verde carregando normalmente, amarelo suspenso (carro ou CSMS
@@ -326,7 +470,7 @@ def _meter_line_color(has_session: bool, suspended: bool, faulted: bool) -> str:
     então "está carregando de verdade ou só suspenso?" exigia ler o
     texto todo em vez de notar pela cor.
     """
-    if not _USE_COLOR:
+    if not use_color:
         return ""
     if faulted:
         return "\033[31m"    # vermelho
@@ -343,78 +487,211 @@ class EVChargerSim(BaseChargePoint):
     Implementa os handlers de mensagens que o CSMS pode mandar PARA o charge point.
     """
 
+    def __init__(self, charge_point_id, connection, config: SimConfig, logger: logging.Logger):
+        super().__init__(charge_point_id, connection)
+        self.config = config
+        self.logger = logger
+        self.state = ChargerState(
+            battery_soc_percent=config.initial_soc_percent,
+            current_heartbeat_interval=config.heartbeat_interval,
+        )
+        self.use_color = sys.stdout.isatty()
+
+        # Task de fundo que percorre os períodos do perfil de carga
+        # atualmente ativo (ver _run_charging_schedule). Guardado à parte
+        # de ChargerState porque é uma asyncio.Task, não um dado de
+        # estado serializável — cancelado e substituído a cada novo
+        # SetChargingProfile/ClearChargingProfile/fim de sessão.
+        self._profile_task: asyncio.Task | None = None
+
     # --------------------------------------------------------
     # Handlers de mensagens recebidas do CSMS
     # --------------------------------------------------------
 
+    def _limit_to_amps(self, limit: float, unit: str) -> float:
+        """
+        Converte um limite de chargingSchedulePeriod para amperes.
+
+        chargingRateUnit pode ser "A" (ampere, já pronto pra uso) ou "W"
+        (watts totais) — um CSMS que manda limites em W é comum (ex:
+        perfis pensados em kW de site) e antes esse valor era tratado
+        como se já estivesse em amperes, o que inflava/reduzia a corrente
+        real aplicada silenciosamente (ex: um limite de 3700W virava
+        "3700A" oferecidos). Convertemos usando a tensão nominal
+        configurada — simplificação de carga monofásica; ajuste aqui se
+        seu CSMS testar perfis trifásicos.
+        """
+        if unit == "W":
+            return round(limit / self.config.nominal_voltage, 2)
+        if unit and unit != "A":
+            self.logger.warning(
+                f"[PERFIL RECEBIDO] chargingRateUnit desconhecido '{unit}' — "
+                "tratando como amperes (A)."
+            )
+        return float(limit)
+
+    def _cancel_profile_task(self):
+        """Cancela a task de agendamento de um perfil anterior, se houver."""
+        if self._profile_task is not None and not self._profile_task.done():
+            self._profile_task.cancel()
+        self._profile_task = None
+
+    def _apply_offered_amps(self, offered_amps: float, source: str):
+        """
+        Aplica um novo limite de corrente oferecida e, se necessário,
+        reflete a mudança num StatusNotification SuspendedEVSE/Charging.
+        Extraído do handler de perfil original para ser reutilizável pelo
+        agendador de múltiplos períodos (_run_charging_schedule) sem
+        duplicar a lógica de suspensão.
+        """
+        state = self.state
+        state.current_offered_amps = offered_amps
+        state.current_actual_amps = compute_actual_current(
+            offered_amps, state.battery_soc_percent
+        )
+        self.logger.info(
+            f"[{source}] limite oferecido={state.current_offered_amps}A | "
+            f"corrente real (SoC {state.battery_soc_percent:.0f}%)={state.current_actual_amps}A"
+        )
+
+        # Reflete no StatusNotification quando o CSMS impõe 0A (ex: fila
+        # de espera do balanceamento de site) ou restaura a corrente
+        # depois — sem isso, o status ficava travado em "Charging" no
+        # dashboard mesmo com a corrente zerada pelo CSMS, já que nada
+        # mais dispararia uma StatusNotification nova nesse caso. Só
+        # entra em jogo se houver sessão ativa e o carro não estiver
+        # voluntariamente pausado (SuspendedEV tem prioridade — são
+        # causas de suspensão diferentes).
+        if state.active_transaction_id is not None and not state.session_suspended:
+            if state.current_offered_amps <= 0.0 and not state.evse_suspended_by_profile:
+                state.evse_suspended_by_profile = True
+                self.logger.info(f"[{source}] 0A imposto pelo CSMS → SuspendedEVSE")
+                asyncio.create_task(self.send_status_notification(
+                    ChargePointStatus.suspended_evse))
+            elif state.current_offered_amps > 0.0 and state.evse_suspended_by_profile:
+                state.evse_suspended_by_profile = False
+                self.logger.info(f"[{source}] corrente restaurada pelo CSMS → Charging")
+                asyncio.create_task(self.send_status_notification(
+                    ChargePointStatus.charging))
+
+    async def _run_charging_schedule(self, periods: list, unit: str):
+        """
+        Percorre TODOS os períodos de um chargingSchedule, não só o
+        primeiro. Antes, um perfil com múltiplos chargingSchedulePeriod
+        (ex: 32A por 10min, depois cai pra 16A) era achatado no valor do
+        primeiro período pra sessão inteira — um CSMS testando perfis com
+        rampas/degraus nunca via o simulador de fato variar a corrente ao
+        longo do tempo.
+
+        Simplificação assumida: cada period["startPeriod"] é tratado como
+        segundos relativos ao momento em que este SetChargingProfile foi
+        recebido (não ao início da transação nem a um startSchedule
+        absoluto do profile) — suficiente pra testar perfis com múltiplos
+        degraus manualmente; perfis recorrentes (Daily/Weekly) e
+        startSchedule absoluto não são interpretados de forma especial.
+        """
+        ordered = sorted(periods, key=lambda p: p.get("start_period", p.get("startPeriod", 0)))
+        try:
+            for i, period in enumerate(ordered):
+                start_period = period.get("start_period", period.get("startPeriod", 0))
+                amps = self._limit_to_amps(period["limit"], unit)
+                self._apply_offered_amps(amps, source="PERFIL RECEBIDO")
+
+                if i + 1 < len(ordered):
+                    next_start = ordered[i + 1].get(
+                        "start_period", ordered[i + 1].get("startPeriod", 0)
+                    )
+                    wait = max(0, next_start - start_period)
+                    if wait > 0:
+                        self.logger.info(
+                            f"[PERFIL RECEBIDO] período atual válido por {wait}s "
+                            f"antes do próximo degrau do perfil"
+                        )
+                        await asyncio.sleep(wait)
+        except asyncio.CancelledError:
+            # Esperado sempre que um novo SetChargingProfile, um
+            # ClearChargingProfile, ou o fim da sessão substitui este
+            # agendamento antes que ele termine sozinho — não é um erro.
+            pass
+
     @on(Action.set_charging_profile)
     async def on_set_charging_profile(self, connector_id, cs_charging_profiles, **kwargs):
         """
-        Chamado quando o CSMS manda um novo perfil de carga (ex: limitar a 10A).
-        Aqui simulamos o charge point "aceitando" e ajustando a corrente.
+        Chamado quando o CSMS manda um novo perfil de carga (ex: limitar a
+        10A, ou uma rampa de vários degraus). Aqui simulamos o charge
+        point "aceitando" e agendando a aplicação de todos os períodos.
         """
-        global current_offered_amps, current_actual_amps, evse_suspended_by_profile
-
-        # O payload recebido via @on chega como dict puro, mas a lib converte
-        # as chaves de camelCase (wire) para snake_case automaticamente.
         schedule = cs_charging_profiles["charging_schedule"]
         periods = schedule["charging_schedule_period"]
+        unit = schedule.get("charging_rate_unit", schedule.get("chargingRateUnit", "A"))
+
+        self._cancel_profile_task()
 
         if periods:
-            # Pega o limite do primeiro período (cenário simples: perfil sem múltiplos períodos)
-            limit = periods[0]["limit"]
-            current_offered_amps = float(limit)
-            current_actual_amps = compute_actual_current(
-                current_offered_amps, battery_soc_percent
-            )
-
-            logger.info(
+            self.logger.info(
                 f"[PERFIL RECEBIDO] connector={connector_id} | "
-                f"limite oferecido={current_offered_amps}A | "
-                f"corrente real (SoC {battery_soc_percent:.0f}%)={current_actual_amps}A"
+                f"{len(periods)} período(s) | unidade={unit}"
             )
-
-            # Reflete no StatusNotification quando o CSMS impõe 0A (ex:
-            # fila de espera do balanceamento de site) ou restaura a
-            # corrente depois — sem isso, o status ficava travado em
-            # "Charging" no dashboard mesmo com a corrente zerada pelo
-            # CSMS, já que nada mais dispararia uma StatusNotification
-            # nova nesse caso. Só entra em jogo se houver sessão ativa e
-            # o carro não estiver voluntariamente pausado (SuspendedEV
-            # tem prioridade — são causas de suspensão diferentes).
-            if active_transaction_id is not None and not session_suspended:
-                if current_offered_amps <= 0.0 and not evse_suspended_by_profile:
-                    evse_suspended_by_profile = True
-                    logger.info(
-                        "[PERFIL RECEBIDO] 0A imposto pelo CSMS → SuspendedEVSE")
-                    asyncio.create_task(self.send_status_notification(
-                        ChargePointStatus.suspended_evse))
-                elif current_offered_amps > 0.0 and evse_suspended_by_profile:
-                    evse_suspended_by_profile = False
-                    logger.info(
-                        "[PERFIL RECEBIDO] corrente restaurada pelo CSMS → Charging")
-                    asyncio.create_task(self.send_status_notification(
-                        ChargePointStatus.charging))
+            self._profile_task = asyncio.create_task(
+                self._run_charging_schedule(periods, unit)
+            )
         else:
-            logger.warning("SetChargingProfile recebido sem chargingSchedulePeriod")
+            self.logger.warning("SetChargingProfile recebido sem chargingSchedulePeriod")
 
         return call_result.SetChargingProfile(status="Accepted")
 
+    @on(Action.clear_charging_profile)
+    async def on_clear_charging_profile(self, **kwargs):
+        """
+        Remove o(s) perfil(is) ativo(s) e volta pro comportamento padrão:
+        corrente padrão do simulador se houver sessão ativa, 0A caso
+        contrário. Antes este Action não tinha handler nenhum — a
+        biblioteca ocpp respondia um NotImplemented genérico pra
+        qualquer CSMS que testasse esse fluxo, e mesmo que respondesse
+        Accepted, current_offered_amps nunca era resetado.
+        """
+        self._cancel_profile_task()
+        state = self.state
+
+        fallback_amps = (
+            self.config.default_offered_amps if state.active_transaction_id is not None else 0.0
+        )
+        self._apply_offered_amps(fallback_amps, source="PERFIL LIMPO")
+        self.logger.info(
+            "[CLEAR CHARGING PROFILE] perfil removido — voltando à corrente "
+            f"padrão ({fallback_amps:.0f}A)"
+        )
+        return call_result.ClearChargingProfile(status="Accepted")
+
     @on(Action.remote_start_transaction)
     async def on_remote_start_transaction(self, id_tag, connector_id=None, **kwargs):
-        logger.info(f"[REMOTE START] id_tag={id_tag} connector={connector_id}")
+        self.logger.info(f"[REMOTE START] id_tag={id_tag} connector={connector_id}")
+        state = self.state
+
+        if state.availability_status == "Inoperative":
+            self.logger.warning(
+                "[REMOTE START] conector Inoperative (ChangeAvailability) — recusando."
+            )
+            return call_result.RemoteStartTransaction(status=RemoteStartStopStatus.rejected)
+        if state.active_transaction_id is not None:
+            self.logger.warning("[REMOTE START] já existe sessão ativa — recusando.")
+            return call_result.RemoteStartTransaction(status=RemoteStartStopStatus.rejected)
+        if state.is_faulted:
+            self.logger.warning("[REMOTE START] charger em Faulted — recusando.")
+            return call_result.RemoteStartTransaction(status=RemoteStartStopStatus.rejected)
+
         # Dispara o envio de StartTransaction em background, DEPOIS de responder
         # Accepted — replica o fluxo real: o carregador aceita o comando e só
         # manda StartTransaction como mensagem separada um instante depois
         # (após fechar o contator / autorizar localmente).
         asyncio.create_task(
-            self._send_start_transaction(connector_id or CONNECTOR_ID, id_tag)
+            self._send_start_transaction(connector_id or self.config.connector_id, id_tag)
         )
         return call_result.RemoteStartTransaction(status=RemoteStartStopStatus.accepted)
 
     @on(Action.remote_stop_transaction)
     async def on_remote_stop_transaction(self, transaction_id, **kwargs):
-        logger.info(f"[REMOTE STOP] transaction_id={transaction_id}")
+        self.logger.info(f"[REMOTE STOP] transaction_id={transaction_id}")
         # Reason.remote é o motivo correto da OCPP para uma sessão encerrada
         # via comando remoto do CSMS (botão "Parar" no dashboard) — sem
         # isso, o campo "reason" ia como None/nulo, e o histórico de
@@ -426,7 +703,40 @@ class EVChargerSim(BaseChargePoint):
 
     @on(Action.change_availability)
     async def on_change_availability(self, connector_id, type, **kwargs):
-        logger.info(f"[CHANGE AVAILABILITY] connector={connector_id} type={type}")
+        """
+        Antes era um stub: sempre respondia Accepted sem guardar nada,
+        então o conector continuava aceitando sessões normalmente mesmo
+        depois de um CSMS marcá-lo Inoperative — um teste de "coloquei o
+        conector fora de serviço, motorista não deveria conseguir
+        carregar" passava no CSMS e falhava silenciosamente aqui.
+
+        Agora: Inoperative com sessão ativa -> Scheduled (aplicado só
+        quando a sessão terminar, como manda o spec); sem sessão ativa
+        -> aplica na hora e manda StatusNotification Unavailable.
+        Operative sempre aplica na hora (cancela um Scheduled pendente,
+        se houver) e volta a Available.
+        """
+        self.logger.info(f"[CHANGE AVAILABILITY] connector={connector_id} type={type}")
+        state = self.state
+
+        if type == AvailabilityType.inoperative:
+            if state.active_transaction_id is not None:
+                state.pending_availability_change = "Inoperative"
+                self.logger.info(
+                    "[CHANGE AVAILABILITY] sessão ativa — mudança para "
+                    "Inoperative agendada para quando a sessão terminar."
+                )
+                return call_result.ChangeAvailability(status=AvailabilityStatus.scheduled)
+
+            state.availability_status = "Inoperative"
+            asyncio.create_task(self.send_status_notification(ChargePointStatus.unavailable))
+            return call_result.ChangeAvailability(status=AvailabilityStatus.accepted)
+
+        # Operative
+        state.pending_availability_change = None
+        state.availability_status = "Operative"
+        if state.active_transaction_id is None and not state.is_faulted:
+            asyncio.create_task(self.send_status_notification(ChargePointStatus.available))
         return call_result.ChangeAvailability(status=AvailabilityStatus.accepted)
 
     @on(Action.reset)
@@ -443,16 +753,17 @@ class EVChargerSim(BaseChargePoint):
         um período maior de indisponibilidade (Unavailable) representando
         o boot do firmware, antes de voltar a Available.
         """
-        logger.info(f"[RESET] type={type}")
+        self.logger.info(f"[RESET] type={type}")
         is_hard = (type == ResetType.hard)
         reason = Reason.hard_reset if is_hard else Reason.soft_reset
 
-        if active_transaction_id is not None:
-            logger.info(
-                f"[RESET] sessão ativa (tx={active_transaction_id}) será "
+        active_id = self.state.active_transaction_id
+        if active_id is not None:
+            self.logger.info(
+                f"[RESET] sessão ativa (tx={active_id}) será "
                 f"interrompida pelo reset"
             )
-            asyncio.create_task(self._handle_reset_flow(active_transaction_id, reason, is_hard))
+            asyncio.create_task(self._handle_reset_flow(active_id, reason, is_hard))
         else:
             asyncio.create_task(self._handle_reset_flow(None, reason, is_hard))
 
@@ -471,16 +782,16 @@ class EVChargerSim(BaseChargePoint):
             # Hard reset: simula o carregador caindo (Unavailable) durante
             # o boot do firmware antes de voltar a responder normalmente.
             await self.send_status_notification(ChargePointStatus.unavailable)
-            logger.info("[RESET] hard reset — simulando reboot do firmware (5s)...")
+            self.logger.info("[RESET] hard reset — simulando reboot do firmware (5s)...")
             await asyncio.sleep(5)
             await self.send_boot_notification()
             await asyncio.sleep(1)
         else:
-            logger.info("[RESET] soft reset — reinício rápido do software (1s)...")
+            self.logger.info("[RESET] soft reset — reinício rápido do software (1s)...")
             await asyncio.sleep(1)
 
         await self.send_status_notification(ChargePointStatus.available)
-        logger.info("[RESET] concluído — carregador disponível novamente")
+        self.logger.info("[RESET] concluído — carregador disponível novamente")
 
     @on(Action.trigger_message)
     async def on_trigger_message(self, requested_message, connector_id=None, **kwargs):
@@ -489,10 +800,10 @@ class EVChargerSim(BaseChargePoint):
         espontaneamente (ex: StatusNotification, Heartbeat). Usado pelo
         status_check() do CSMS real para forçar uma atualização de estado.
         """
-        logger.info(f"[TRIGGER MESSAGE] requested={requested_message} connector={connector_id}")
+        self.logger.info(f"[TRIGGER MESSAGE] requested={requested_message} connector={connector_id}")
         if requested_message == "StatusNotification":
             current_status = (
-                ChargePointStatus.charging if active_transaction_id is not None
+                ChargePointStatus.charging if self.state.active_transaction_id is not None
                 else ChargePointStatus.available
             )
             asyncio.create_task(self.send_status_notification(current_status))
@@ -510,7 +821,7 @@ class EVChargerSim(BaseChargePoint):
         CSMS depender de valores específicos.
 
         IMPORTANTE: HeartbeatInterval é reportado a partir do valor REAL
-        em uso (current_heartbeat_interval), não um número fixo. O
+        em uso (state.current_heartbeat_interval), não um número fixo. O
         charger.py do CSMS tem um sync loop (start_sync_loop) que roda a
         cada 60s, chama GetConfiguration, e SOBRESCREVE self.st.heartbeat_interval
         com o que vier aqui — se este handler sempre respondesse um valor
@@ -524,13 +835,29 @@ class EVChargerSim(BaseChargePoint):
         # HeartbeatInterval e o limite físico — mesmo padrão de ruído
         # periódico do Heartbeat, sem informação nova na maioria dos
         # ciclos. Só aparece no terminal com --verbose.
-        logger.debug(f"[GET CONFIGURATION] keys solicitadas={key}")
+        self.logger.debug(f"[GET CONFIGURATION] keys solicitadas={key}")
         all_config = [
-            {"key": "HeartbeatInterval", "readonly": False, "value": str(current_heartbeat_interval)},
-            {"key": "MeterValueSampleInterval", "readonly": False, "value": str(METER_VALUES_INTERVAL)},
+            {"key": "HeartbeatInterval", "readonly": False,
+             "value": str(self.state.current_heartbeat_interval)},
+            {"key": "MeterValueSampleInterval", "readonly": False,
+             "value": str(self.config.meter_values_interval)},
             {"key": "ConnectorPhaseRotation", "readonly": True, "value": "NotApplicable"},
             {"key": "NumberOfConnectors", "readonly": True, "value": "1"},
-            {"key": "SupportedFeatureProfiles", "readonly": True, "value": "Core,SmartCharging"},
+            # Atualizado para incluir Reservation, LocalAuthListManagement e
+            # FirmwareManagement — ficou desatualizado (só "Core,SmartCharging")
+            # depois que os handlers dessas Actions foram implementados, o que
+            # fazia o simulador se anunciar com menos capacidades do que
+            # realmente suporta para um CSMS que consulta isso antes de decidir
+            # o que enviar.
+            {"key": "SupportedFeatureProfiles", "readonly": True,
+             "value": "Core,SmartCharging,Reservation,LocalAuthListManagement,FirmwareManagement"},
+            {"key": "LocalAuthListEnabled", "readonly": False, "value": "true"},
+            {"key": "LocalAuthListMaxLength", "readonly": True, "value": "100"},
+            {"key": "SendLocalListMaxLength", "readonly": True, "value": "20"},
+            # Reserva por conector (não por charge point inteiro / conector 0).
+            {"key": "ReserveConnectorZeroSupported", "readonly": True, "value": "false"},
+            {"key": "AvailabilityStatus", "readonly": True,
+             "value": self.state.availability_status},
         ]
         if key:
             # CSMS pediu chaves específicas: filtra e reporta as desconhecidas
@@ -542,40 +869,252 @@ class EVChargerSim(BaseChargePoint):
 
     @on(Action.change_configuration)
     async def on_change_configuration(self, key, value, **kwargs):
-        global current_heartbeat_interval
-        logger.info(f"[CHANGE CONFIGURATION] key={key} value={value}")
+        self.logger.info(f"[CHANGE CONFIGURATION] key={key} value={value}")
 
         if key == "HeartbeatInterval":
             try:
-                current_heartbeat_interval = int(value)
-                logger.info(
+                self.state.current_heartbeat_interval = int(value)
+                self.logger.info(
                     f"[HEARTBEAT] intervalo atualizado para "
-                    f"{current_heartbeat_interval}s — efeito no próximo ciclo"
+                    f"{self.state.current_heartbeat_interval}s — efeito no próximo ciclo"
                 )
             except ValueError:
-                logger.warning(f"[CHANGE CONFIGURATION] valor inválido para HeartbeatInterval: {value}")
+                self.logger.warning(f"[CHANGE CONFIGURATION] valor inválido para HeartbeatInterval: {value}")
                 return call_result.ChangeConfiguration(status="Rejected")
         # Outras chaves (ex: MeterValueSampleInterval) são aceitas mas não
         # têm efeito simulado — o intervalo de MeterValues deste simulador
-        # é fixo via METER_VALUES_INTERVAL no topo do arquivo, já que não
-        # é esse o foco do bug reportado. Expanda aqui se precisar testar
+        # é fixo via config.meter_values_interval no boot, já que não é
+        # esse o foco do bug reportado. Expanda aqui se precisar testar
         # mudança desse valor especificamente.
 
         return call_result.ChangeConfiguration(status="Accepted")
+
+    @on(Action.unlock_connector)
+    async def on_unlock_connector(self, connector_id, **kwargs):
+        """
+        Comando do operador (dashboard "Destravar conector") para liberar
+        o conector mecanicamente — ex: motorista esqueceu o cabo travado
+        e precisa de ajuda remota para soltá-lo. Não tinha handler antes;
+        a lib respondia um NotImplemented genérico pra qualquer CSMS que
+        testasse esse fluxo.
+        """
+        self.logger.info(f"[UNLOCK CONNECTOR] connector={connector_id}")
+        if self.state.active_transaction_id is not None:
+            # Comportamento simplificado: um charger físico real pode
+            # recusar (UnlockFailed) se o EV ainda estiver puxando
+            # corrente, ou pode destravar mesmo assim dependendo do
+            # hardware. Aqui só avisamos no log e reportamos sucesso —
+            # não paramos a sessão automaticamente, já que UnlockConnector
+            # não é, por si só, um pedido de StopTransaction.
+            self.logger.warning(
+                "[UNLOCK CONNECTOR] há uma sessão ativa — destravando o "
+                "conector sem encerrar a sessão (comportamento simplificado)."
+            )
+        return call_result.UnlockConnector(status=UnlockStatus.unlocked)
+
+    @on(Action.data_transfer)
+    async def on_data_transfer(self, vendor_id, message_id=None, data=None, **kwargs):
+        """
+        Extensão vendor-specific do OCPP — usada para testar payloads
+        fora do schema padrão sem precisar de uma Action nova. Este
+        simulador só reconhece seu próprio vendor_id (echo, útil para
+        confirmar que o transporte ida-e-volta funciona); qualquer outro
+        vendor_id recebe UnknownVendorId, como manda o spec.
+        """
+        self.logger.info(
+            f"[DATA TRANSFER] recebido | vendor_id={vendor_id} "
+            f"message_id={message_id} data={data!r}"
+        )
+        if vendor_id != "EVChargerSim":
+            return call_result.DataTransfer(status=DataTransferStatus.unknown_vendor_id)
+        return call_result.DataTransfer(status=DataTransferStatus.accepted, data=data)
+
+    @on(Action.get_diagnostics)
+    async def on_get_diagnostics(self, location, **kwargs):
+        """
+        CSMS pedindo upload de um arquivo de diagnóstico (logs internos).
+        Simulamos o nome do arquivo e a sequência de status
+        (Uploading -> Uploaded) sem de fato subir nada para `location` —
+        suficiente pra testar se o CSMS reage certo às notificações.
+        """
+        file_name = f"diagnostics_{self.config.charge_point_id}_{int(datetime.now(timezone.utc).timestamp())}.zip"
+        self.logger.info(f"[GET DIAGNOSTICS] location={location} | arquivo simulado: {file_name}")
+        asyncio.create_task(self._simulate_diagnostics_upload())
+        return call_result.GetDiagnostics(file_name=file_name)
+
+    async def _simulate_diagnostics_upload(self):
+        await asyncio.sleep(1)
+        await self.call(call.DiagnosticsStatusNotification(status=DiagnosticsStatus.uploading))
+        self.logger.info("[DIAGNOSTICS] status: Uploading")
+        await asyncio.sleep(2)
+        await self.call(call.DiagnosticsStatusNotification(status=DiagnosticsStatus.uploaded))
+        self.logger.info("[DIAGNOSTICS] status: Uploaded")
+
+    @on(Action.update_firmware)
+    async def on_update_firmware(self, location, retrieve_date, **kwargs):
+        """
+        CSMS mandando atualizar o firmware. Um update de firmware real
+        interrompe qualquer sessão ativa (o charger reinicia no fim) —
+        replicamos isso encerrando a transação antes da sequência de
+        download/instalação, igual ao hard reset.
+        """
+        self.logger.info(f"[UPDATE FIRMWARE] location={location} retrieve_date={retrieve_date}")
+        asyncio.create_task(self._simulate_firmware_update())
+        return call_result.UpdateFirmware()
+
+    async def _simulate_firmware_update(self):
+        state = self.state
+        if state.active_transaction_id is not None:
+            self.logger.warning(
+                f"[FIRMWARE] sessão ativa (tx={state.active_transaction_id}) será "
+                "encerrada — o firmware update vai reiniciar o charger."
+            )
+            await self._send_stop_transaction(
+                state.active_transaction_id, reason=Reason.other, skip_status_flow=True
+            )
+
+        for status, delay in (
+            (FirmwareStatus.downloading, 1),
+            (FirmwareStatus.downloaded, 1),
+            (FirmwareStatus.installing, 1),
+        ):
+            await self.call(call.FirmwareStatusNotification(status=status))
+            self.logger.info(f"[FIRMWARE] status: {status.value}")
+            await asyncio.sleep(delay)
+
+        # Reboot simulado, mesma sequência do hard reset.
+        await self.send_status_notification(ChargePointStatus.unavailable)
+        await asyncio.sleep(3)
+        await self.send_boot_notification()
+        await asyncio.sleep(1)
+        await self.send_status_notification(ChargePointStatus.available)
+
+        await self.call(call.FirmwareStatusNotification(status=FirmwareStatus.installed))
+        self.logger.info("[FIRMWARE] status: Installed — atualização concluída")
+
+    @on(Action.reserve_now)
+    async def on_reserve_now(
+        self, connector_id, expiry_date, id_tag, reservation_id, parent_id_tag=None, **kwargs
+    ):
+        """
+        Reserva o conector para um id_tag (ou grupo, via parent_id_tag)
+        específico até expiry_date. Enquanto reservado, "start" local só
+        aceita esse id_tag — ver console_command_loop.
+        """
+        state = self.state
+        self.logger.info(
+            f"[RESERVE NOW] connector={connector_id} id_tag={id_tag} "
+            f"reservation_id={reservation_id} expiry={expiry_date}"
+        )
+
+        if state.is_faulted:
+            return call_result.ReserveNow(status=ReservationStatus.faulted)
+        if state.active_transaction_id is not None or state.reservation_id is not None:
+            self.logger.warning(
+                "[RESERVE NOW] conector já ocupado (sessão ativa ou já "
+                "reservado) — rejeitando com Occupied."
+            )
+            return call_result.ReserveNow(status=ReservationStatus.occupied)
+
+        state.reservation_id = reservation_id
+        state.reserved_for_id_tag = id_tag
+        state.reserved_parent_id_tag = parent_id_tag
+        asyncio.create_task(self.send_status_notification(ChargePointStatus.reserved))
+        asyncio.create_task(self._expire_reservation_at(reservation_id, expiry_date))
+        return call_result.ReserveNow(status=ReservationStatus.accepted)
+
+    async def _expire_reservation_at(self, reservation_id: int, expiry_date: str):
+        """
+        Limpa a reserva sozinha quando expiry_date passa, sem precisar de
+        um CancelReservation explícito — replica o comportamento real de
+        uma reserva não usada expirar e o conector voltar a Available.
+        """
+        try:
+            expiry = datetime.fromisoformat(expiry_date.replace("Z", "+00:00"))
+            delay = (expiry - datetime.now(timezone.utc)).total_seconds()
+        except ValueError:
+            self.logger.warning(
+                f"[RESERVE NOW] expiry_date inválido/não-ISO8601 ('{expiry_date}') — "
+                "reserva não expira automaticamente, só via CancelReservation."
+            )
+            return
+
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        state = self.state
+        if state.reservation_id == reservation_id:
+            self.logger.info(f"[RESERVE NOW] reserva {reservation_id} expirou sem uso")
+            state.reservation_id = None
+            state.reserved_for_id_tag = None
+            state.reserved_parent_id_tag = None
+            if state.active_transaction_id is None and not state.is_faulted:
+                await self.send_status_notification(ChargePointStatus.available)
+
+    @on(Action.cancel_reservation)
+    async def on_cancel_reservation(self, reservation_id, **kwargs):
+        state = self.state
+        self.logger.info(f"[CANCEL RESERVATION] reservation_id={reservation_id}")
+        if state.reservation_id != reservation_id:
+            return call_result.CancelReservation(status=CancelReservationStatus.rejected)
+
+        state.reservation_id = None
+        state.reserved_for_id_tag = None
+        state.reserved_parent_id_tag = None
+        if state.active_transaction_id is None and not state.is_faulted:
+            asyncio.create_task(self.send_status_notification(ChargePointStatus.available))
+        return call_result.CancelReservation(status=CancelReservationStatus.accepted)
+
+    @on(Action.get_local_list_version)
+    async def on_get_local_list_version(self, **kwargs):
+        self.logger.debug(f"[GET LOCAL LIST VERSION] atual={self.state.local_list_version}")
+        return call_result.GetLocalListVersion(list_version=self.state.local_list_version)
+
+    @on(Action.send_local_list)
+    async def on_send_local_list(
+        self, list_version, update_type, local_authorization_list=None, **kwargs
+    ):
+        """
+        Recebe (parte d)a lista local de autorização do CSMS. "Full"
+        substitui a lista inteira; "Differential" aplica só as entradas
+        enviadas (uma entrada sem id_tag_info remove aquele id_tag da
+        lista — comportamento padrão OCPP 1.6 para remoção diferencial).
+        """
+        state = self.state
+        entries = local_authorization_list or []
+
+        if update_type == "Full":
+            state.local_auth_list = {}
+
+        for entry in entries:
+            entry_id_tag = entry.get("id_tag") or entry.get("idTag")
+            id_tag_info = entry.get("id_tag_info") or entry.get("idTagInfo")
+            if not entry_id_tag:
+                continue
+            if id_tag_info is None:
+                state.local_auth_list.pop(entry_id_tag, None)
+                continue
+            state.local_auth_list[entry_id_tag] = id_tag_info.get("status", "Accepted")
+
+        state.local_list_version = list_version
+        self.logger.info(
+            f"[SEND LOCAL LIST] update_type={update_type} | "
+            f"nova versão={list_version} | {len(state.local_auth_list)} id_tag(s) na lista"
+        )
+        return call_result.SendLocalList(status=UpdateStatus.accepted)
 
     # --------------------------------------------------------
     # Rotinas que o charge point envia PARA o CSMS
     # --------------------------------------------------------
 
     async def send_boot_notification(self):
-        global battery_soc_percent, is_faulted
-        battery_soc_percent = INITIAL_SOC_PERCENT
+        self.state.battery_soc_percent = self.config.initial_soc_percent
         # Um (re)boot é um bom ponto pra limpar uma falha simulada — cada
         # nova conexão começa "limpa" em vez de herdar Faulted de uma
         # sessão de simulador anterior (ex: depois de uma reconexão
         # automática).
-        is_faulted = False
-        logger.info(f"[BATERIA] SoC inicial: {_soc_bar(battery_soc_percent)}")
+        self.state.is_faulted = False
+        self.logger.info(f"[BATERIA] SoC inicial: {_soc_bar(self.state.battery_soc_percent)}")
 
         request = call.BootNotification(
             charge_point_model="EVChargerSim",
@@ -584,18 +1123,18 @@ class EVChargerSim(BaseChargePoint):
         )
         response = await self.call(request)
         if response.status == RegistrationStatus.accepted:
-            logger.info("BootNotification aceito pelo CSMS.")
+            self.logger.info("BootNotification aceito pelo CSMS.")
         else:
-            logger.warning(f"BootNotification respondido com status: {response.status}")
+            self.logger.warning(f"BootNotification respondido com status: {response.status}")
 
     async def send_status_notification(self, status: str):
         request = call.StatusNotification(
-            connector_id=CONNECTOR_ID,
+            connector_id=self.config.connector_id,
             error_code=ChargePointErrorCode.no_error,
             status=status,
         )
         await self.call(request)
-        logger.info(f"StatusNotification enviado: {status}")
+        self.logger.info(f"StatusNotification enviado: {status}")
 
     async def _send_start_transaction(self, connector_id: int, id_tag: str):
         """
@@ -603,16 +1142,21 @@ class EVChargerSim(BaseChargePoint):
         o contator. Sem isso, o CSMS nunca recebe um transaction_id e a
         sessão nunca é registrada (nem no dashboard, nem no banco).
         """
-        global active_transaction_id, current_offered_amps, current_actual_amps
-        global battery_soc_percent, energy_meter_wh, session_suspended
-
+        state = self.state
         try:
+            # Cancela qualquer agendamento de perfil de uma sessão
+            # anterior — sem isso, uma _run_charging_schedule pendente
+            # (ex: perfil de 3 degraus que não tinha terminado quando a
+            # sessão anterior encerrou) podia "acordar" no meio desta
+            # nova sessão e pisar na corrente que ela acabou de aplicar.
+            self._cancel_profile_task()
+
             # Cada nova sessão reseta SoC e medidor, evitando que sessões
             # sucessivas encadeiem o estado da sessão anterior.
-            battery_soc_percent = INITIAL_SOC_PERCENT
-            energy_meter_wh = 0.0
-            session_suspended = False
-            logger.info(f"[BATERIA] SoC inicial desta sessão: {_soc_bar(battery_soc_percent)}")
+            state.battery_soc_percent = self.config.initial_soc_percent
+            state.energy_meter_wh = 0.0
+            state.session_suspended = False
+            self.logger.info(f"[BATERIA] SoC inicial desta sessão: {_soc_bar(state.battery_soc_percent)}")
 
             # Aplica a corrente padrão residencial imediatamente, antes de
             # qualquer SetChargingProfile chegar do CSMS. Sem isso, a sessão
@@ -620,13 +1164,13 @@ class EVChargerSim(BaseChargePoint):
             # o que é artificial, pois um carregador físico começa a entregar
             # corrente assim que o contator fecha. O CSMS ainda pode sobrescrever
             # este valor com SetChargingProfile a qualquer momento.
-            current_offered_amps = DEFAULT_OFFERED_AMPS
-            current_actual_amps = compute_actual_current(
-                current_offered_amps, battery_soc_percent
+            state.current_offered_amps = self.config.default_offered_amps
+            state.current_actual_amps = compute_actual_current(
+                state.current_offered_amps, state.battery_soc_percent
             )
-            logger.info(
-                f"[SESSION] Corrente inicial: {current_offered_amps:.0f}A oferecido "
-                f"/ {current_actual_amps:.1f}A real (aguardando SetChargingProfile do CSMS)"
+            self.logger.info(
+                f"[SESSION] Corrente inicial: {state.current_offered_amps:.0f}A oferecido "
+                f"/ {state.current_actual_amps:.1f}A real (aguardando SetChargingProfile do CSMS)"
             )
 
             # Simula o veículo sendo conectado e o carregador preparando
@@ -637,30 +1181,52 @@ class EVChargerSim(BaseChargePoint):
             request = call.StartTransaction(
                 connector_id=connector_id,
                 id_tag=id_tag,
-                meter_start=int(energy_meter_wh),
+                meter_start=int(state.energy_meter_wh),
                 timestamp=datetime.now(timezone.utc).isoformat(),
             )
-            response = await self.call(request)
-            active_transaction_id = response.transaction_id
-            logger.info(
+            # Timeout explícito: sem isso, um CSMS que trava sem
+            # responder deixa este await pendurado pra sempre — nenhuma
+            # exceção, nenhum log, a sessão simplesmente nunca avança
+            # (nem falha nem é registrada), e ninguém percebe até
+            # reparar que o simulador ficou mudo.
+            response = await asyncio.wait_for(
+                self.call(request), timeout=self.config.call_timeout_seconds
+            )
+            state.active_transaction_id = response.transaction_id
+            self.logger.info(
                 f"⚡ [START TRANSACTION] aceito pelo CSMS | "
-                f"transaction_id={active_transaction_id} | id_tag={id_tag}"
+                f"transaction_id={state.active_transaction_id} | id_tag={id_tag}"
             )
 
-            # Nota: não definimos uma corrente "chute inicial" aqui. O CSMS real
-            # (visto em main.py/run_tests) já envia um SetChargingProfile logo
-            # após o boot — é esse comando que vai popular current_offered_amps
-            # de forma correta, refletindo o limite configurado de verdade.
-            # Até esse comando chegar, o carregador fica em Charging com 0A,
-            # que é exatamente o que acontece num charger AC real entre o
-            # fechamento do contator e a aplicação do primeiro perfil.
+            # Uma sessão que começa consome a reserva do conector, se
+            # houver uma — um charger físico real libera a reserva assim
+            # que o id_tag correto é usado, não só quando ela expira.
+            if state.reservation_id is not None:
+                self.logger.info(
+                    f"[SESSION] reserva {state.reservation_id} consumida pelo início desta sessão"
+                )
+                state.reservation_id = None
+                state.reserved_for_id_tag = None
+                state.reserved_parent_id_tag = None
+
+            # Nota: não definimos uma corrente "chute inicial" aqui além da
+            # já aplicada acima. O CSMS real já envia um SetChargingProfile
+            # logo após o boot — é esse comando que vai popular
+            # current_offered_amps de forma correta, refletindo o limite
+            # configurado de verdade.
 
             await self.send_status_notification(ChargePointStatus.charging)
+        except asyncio.TimeoutError:
+            self.logger.error(
+                f"[START TRANSACTION] CSMS não respondeu em "
+                f"{self.config.call_timeout_seconds}s — sessão NÃO foi "
+                "registrada. Verifique se o CSMS está processando mensagens."
+            )
         except Exception:
             # Sem isso, uma falha aqui (ex: conexão caiu nesse meio tempo)
             # morre silenciosamente — a task roda em segundo plano via
             # create_task e ninguém nunca dá "await" nela para propagar o erro.
-            logger.exception(
+            self.logger.exception(
                 "[START TRANSACTION] FALHOU ao enviar — sessão NÃO foi "
                 "registrada no CSMS. Verifique se a conexão ainda está ativa."
             )
@@ -683,47 +1249,87 @@ class EVChargerSim(BaseChargePoint):
         automaticamente (usado pelo hard reset, que tem sua própria
         sequência de status simulando o reboot do firmware).
         """
-        global active_transaction_id, current_offered_amps, current_actual_amps
-        global session_suspended, evse_suspended_by_profile
-
+        state = self.state
+        # Cancela o agendamento de perfil ativo — sem sessão, não faz
+        # sentido continuar aplicando degraus de corrente de um perfil
+        # cujo alvo (a transação) acabou de encerrar.
+        self._cancel_profile_task()
         try:
             await asyncio.sleep(0.5)
 
             request = call.StopTransaction(
-                meter_stop=int(energy_meter_wh),
+                meter_stop=int(state.energy_meter_wh),
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 transaction_id=transaction_id,
                 reason=reason,
             )
-            await self.call(request)
-            logger.info(
+            # Mesmo timeout explícito do _send_start_transaction — ver
+            # comentário lá para o porquê.
+            await asyncio.wait_for(
+                self.call(request), timeout=self.config.call_timeout_seconds
+            )
+            self.logger.info(
                 f"🛑 [STOP TRANSACTION] enviado | transaction_id={transaction_id}"
                 + (f" | motivo={reason.value}" if reason else "")
             )
 
-            active_transaction_id = None
-            current_offered_amps = 0.0
-            current_actual_amps = 0.0
-            session_suspended = False
-            evse_suspended_by_profile = False
+            state.active_transaction_id = None
+            state.current_offered_amps = 0.0
+            state.current_actual_amps = 0.0
+            state.session_suspended = False
+            state.evse_suspended_by_profile = False
 
             if skip_status_flow:
+                # Usado por reset/fault/firmware, que têm sua própria
+                # sequência final de status. Uma mudança de disponibilidade
+                # agendada durante a sessão não é aplicada aqui para não
+                # brigar com essa sequência própria — só avisamos no log
+                # que ela ficou pendente, em vez de aplicá-la silenciosamente
+                # e ela ser sobrescrita um instante depois pelo Available
+                # final do reset.
+                if state.pending_availability_change is not None:
+                    self.logger.warning(
+                        "[CHANGE AVAILABILITY] mudança para Inoperative estava "
+                        "agendada, mas a sessão terminou via reset/fault/firmware "
+                        "(sequência de status própria) — reenvie ChangeAvailability "
+                        "se ainda quiser aplicá-la."
+                    )
+                    state.pending_availability_change = None
+                return
+
+            # Uma mudança para Inoperative pedida durante esta sessão só é
+            # aplicada agora que ela terminou — ver on_change_availability.
+            if state.pending_availability_change == "Inoperative":
+                state.availability_status = "Inoperative"
+                state.pending_availability_change = None
+                self.logger.info(
+                    "[CHANGE AVAILABILITY] aplicando mudança para Inoperative "
+                    "agendada, agora que a sessão terminou."
+                )
+                await self.send_status_notification(ChargePointStatus.unavailable)
                 return
 
             # Sequência realista de encerramento: Finishing (carregador
             # liberando o conector / EV ainda fisicamente plugado por um
             # instante) e, pouco depois, Available (pronto para o próximo
-            # veículo). Sem isso, o conector ficava "presto" em Charging
+            # veículo). Sem isso, o conector ficava "preso" em Charging
             # mesmo sem nenhuma sessão ativa, e o MeterValues continuava
             # sendo reportado como se ainda houvesse carregamento.
             await self.send_status_notification(ChargePointStatus.finishing)
             await asyncio.sleep(2)
             await self.send_status_notification(ChargePointStatus.available)
+        except asyncio.TimeoutError:
+            self.logger.error(
+                f"[STOP TRANSACTION] CSMS não respondeu em "
+                f"{self.config.call_timeout_seconds}s — a sessão "
+                f"(transaction_id={transaction_id}) vai continuar 'pendurada' "
+                "como ativa no banco de dados até ser encerrada manualmente."
+            )
         except Exception:
             # Mesmo cuidado do _send_start_transaction: sem isso, a sessão
             # fica "pendurada" no banco (started_at preenchido, stopped_at
             # nulo para sempre) sem nenhum aviso de que algo falhou.
-            logger.exception(
+            self.logger.exception(
                 "[STOP TRANSACTION] FALHOU ao enviar — a sessão "
                 f"(transaction_id={transaction_id}) vai continuar 'pendurada' "
                 "como ativa no banco de dados até ser encerrada manualmente."
@@ -735,79 +1341,92 @@ class EVChargerSim(BaseChargePoint):
         A cada ciclo avança o SoC e recalcula a corrente (tapering).
         Ao atingir 100%, manda StopTransaction automaticamente — simula o
         EV sinalizando que não aceita mais carga (BMS cheio).
+
+        config.simulation_speed multiplica o delta de energia por ciclo —
+        note que isso só acelera o acúmulo de energia/SoC, o intervalo
+        real entre ciclos (interval_seconds) não muda, então o
+        MeterValues continua sendo reportado no cadência OCPP normal;
+        só o quanto de energia é somado por ciclo é que anda mais rápido.
+        Antes esse fator existia como constante (SIMULATION_SPEED) mas
+        nunca era de fato aplicado em lugar nenhum — sessões "aceleradas"
+        não tinham efeito algum na prática.
         """
-        global energy_meter_wh, battery_soc_percent, current_actual_amps
+        state = self.state
         while True:
             await asyncio.sleep(interval_seconds)
 
-            if active_transaction_id is None:
+            if state.active_transaction_id is None:
                 continue
-            if session_suspended or current_actual_amps <= 0:
+            if state.session_suspended or state.current_actual_amps <= 0:
                 continue
 
-            power_w = NOMINAL_VOLTAGE * current_actual_amps
-            energy_delta_wh = power_w * (interval_seconds / 3600)
-            energy_meter_wh += energy_delta_wh
+            power_w = self.config.nominal_voltage * state.current_actual_amps
+            energy_delta_wh = (
+                power_w * (interval_seconds / 3600) * self.config.simulation_speed
+            )
+            state.energy_meter_wh += energy_delta_wh
 
-            battery_soc_percent = min(
+            state.battery_soc_percent = min(
                 100.0,
-                battery_soc_percent + (energy_delta_wh / BATTERY_CAPACITY_WH) * 100,
+                state.battery_soc_percent
+                + (energy_delta_wh / self.config.battery_capacity_wh) * 100,
             )
-            current_actual_amps = compute_actual_current(
-                current_offered_amps, battery_soc_percent
+            state.current_actual_amps = compute_actual_current(
+                state.current_offered_amps, state.battery_soc_percent
             )
 
-            if battery_soc_percent >= 100.0:
-                current_actual_amps = 0.0
-                logger.info(
+            if state.battery_soc_percent >= 100.0:
+                state.current_actual_amps = 0.0
+                self.logger.info(
                     "[BATERIA] SoC atingiu 100% — EV sinalizou bateria cheia. "
                     "Encerrando sessão automaticamente (Reason.ev_disconnected)."
                 )
                 asyncio.create_task(
                     self._send_stop_transaction(
-                        active_transaction_id, reason=Reason.ev_disconnected
+                        state.active_transaction_id, reason=Reason.ev_disconnected
                     )
                 )
 
     async def send_heartbeat_loop(self):
         """
-        O intervalo usado é current_heartbeat_interval (variável global),
-        relido a cada ciclo — assim, uma mudança de HeartbeatInterval feita
-        via CSMS (on_change_configuration) tem efeito já no próximo
+        O intervalo usado é state.current_heartbeat_interval, relido a
+        cada ciclo — assim, uma mudança de HeartbeatInterval feita via
+        CSMS (on_change_configuration) tem efeito já no próximo
         heartbeat, sem precisar reiniciar o simulador.
         """
         while True:
             await self.call(call.Heartbeat())
             # DEBUG, não INFO: essa linha nunca traz informação nova (é
             # literalmente "ainda estou vivo" a cada ciclo) — só aparece
-            # no terminal com --verbose. Use --verbose se precisar
-            # confirmar visualmente que o heartbeat está saindo no
-            # intervalo certo.
-            logger.debug(f"Heartbeat enviado (intervalo atual: {current_heartbeat_interval}s).")
-            await asyncio.sleep(current_heartbeat_interval)
+            # no terminal com --verbose.
+            self.logger.debug(
+                f"Heartbeat enviado (intervalo atual: {self.state.current_heartbeat_interval}s)."
+            )
+            await asyncio.sleep(self.state.current_heartbeat_interval)
 
     async def send_meter_values_loop(self, interval_seconds: int = 30):
         """
         Manda MeterValues periodicamente reportando a corrente "real" simulada.
         Isso é o que vai aparecer no seu dashboard como se fosse o charger reportando.
         """
+        state = self.state
         while True:
             timestamp = datetime.now(timezone.utc).isoformat()
-            voltage_now = read_grid_voltage()
+            voltage_now = read_grid_voltage(self.config.nominal_voltage)
             request = call.MeterValues(
-                connector_id=CONNECTOR_ID,
+                connector_id=self.config.connector_id,
                 meter_value=[
                     {
                         "timestamp": timestamp,
                         "sampledValue": [
                             {
-                                "value": str(current_actual_amps),
+                                "value": str(state.current_actual_amps),
                                 "context": "Sample.Periodic",
                                 "measurand": "Current.Import",
                                 "unit": "A",
                             },
                             {
-                                "value": str(current_offered_amps),
+                                "value": str(state.current_offered_amps),
                                 "context": "Sample.Periodic",
                                 "measurand": "Current.Offered",
                                 "unit": "A",
@@ -819,13 +1438,13 @@ class EVChargerSim(BaseChargePoint):
                                 "unit": "V",
                             },
                             {
-                                "value": str(round(voltage_now * current_actual_amps, 1)),
+                                "value": str(round(voltage_now * state.current_actual_amps, 1)),
                                 "context": "Sample.Periodic",
                                 "measurand": "Power.Active.Import",
                                 "unit": "W",
                             },
                             {
-                                "value": str(int(energy_meter_wh)),
+                                "value": str(int(state.energy_meter_wh)),
                                 "context": "Sample.Periodic",
                                 "measurand": "Energy.Active.Import.Register",
                                 "unit": "Wh",
@@ -836,30 +1455,26 @@ class EVChargerSim(BaseChargePoint):
             )
             await self.call(request)
 
-            power_kw = round((voltage_now * current_actual_amps) / 1000, 2)
-            energy_kwh = round(energy_meter_wh / 1000, 2)
+            power_kw = round((voltage_now * state.current_actual_amps) / 1000, 2)
+            energy_kwh = round(state.energy_meter_wh / 1000, 2)
 
-            has_session = active_transaction_id is not None
-            suspended = session_suspended or evse_suspended_by_profile
-            color = _meter_line_color(has_session, suspended, is_faulted)
-            reset = "\033[0m" if _USE_COLOR else ""
+            has_session = state.active_transaction_id is not None
+            suspended = state.session_suspended or state.evse_suspended_by_profile
+            color = _meter_line_color(has_session, suspended, state.is_faulted, self.use_color)
+            reset = "\033[0m" if self.use_color else ""
 
             # INFO (visível por padrão) — diferente do Heartbeat, esta é a
             # única linha que mostra o que está de fato acontecendo com a
             # sessão (SoC, corrente, potência), então vale ficar visível
-            # sem precisar de --verbose. Formato compacto: sem as palavras
-            # "ofertado"/"acumulado" ocupando espaço — a barra de unidades
-            # (A, kW, kWh) já deixa claro o que é o quê, e a notação
-            # "real/oferecido" com "/" é mais rápida de escanear do que
-            # dois blocos de texto separados por "|".
+            # sem precisar de --verbose.
             if has_session:
-                logger.info(
-                    f"{color}🔋 {_soc_bar(battery_soc_percent)}  "
-                    f"⚡ {current_actual_amps:4.1f}/{current_offered_amps:4.1f}A  "
+                self.logger.info(
+                    f"{color}🔋 {_soc_bar(state.battery_soc_percent)}  "
+                    f"⚡ {state.current_actual_amps:4.1f}/{state.current_offered_amps:4.1f}A  "
                     f"{power_kw:5.2f}kW  Σ{energy_kwh:6.2f}kWh{reset}"
                 )
             else:
-                logger.info(f"{color}🔋 sem sessão ativa{reset}")
+                self.logger.info(f"{color}🔋 sem sessão ativa{reset}")
 
             await asyncio.sleep(interval_seconds)
 
@@ -870,22 +1485,17 @@ class EVChargerSim(BaseChargePoint):
         eventos que nunca chegam via CSMS, mas que um charger físico real
         geraria sozinho.
         """
-        global session_suspended
-
+        state = self.state
         loop = asyncio.get_running_loop()
-        logger.info(
+        self.logger.info(
             "[CONSOLE] Pronto. Comandos: start <id_tag> | stop | pause | "
-            "resume | fault <código> | clear | help"
+            "resume | fault <código> | clear | datatransfer | help"
         )
         # Prompt visível (">> ") em vez de input() sem marcador nenhum —
         # sem isso, era fácil perder de vista onde exatamente o terminal
         # esperava você digitar algo no meio do stream de heartbeats e
-        # meter values rolando por cima. Nota: como o prompt é escrito
-        # pelo input() da thread do executor, ele ainda pode ficar
-        # visualmente "cortado" por uma linha de log que chega bem no
-        # instante em que ele é impresso — cosmético, sem efeito na
-        # leitura do comando em si.
-        prompt = "\033[32m>> \033[0m" if _USE_COLOR else ">> "
+        # meter values rolando por cima.
+        prompt = "\033[32m>> \033[0m" if self.use_color else ">> "
         while True:
             raw = await loop.run_in_executor(None, input, prompt)
             parts = raw.strip().split()
@@ -894,91 +1504,97 @@ class EVChargerSim(BaseChargePoint):
             cmd = parts[0].lower()
 
             # ── start <id_tag> ──────────────────────────────────────────
-            # Simula o motorista passando o RFID no totem: o carregador
-            # chama Authorize localmente e, se aceito, inicia a transação —
-            # sem precisar de RemoteStartTransaction vindo do CSMS.
             if cmd == "start":
-                if active_transaction_id is not None:
-                    logger.warning("[CONSOLE] Já existe uma sessão ativa.")
+                if state.active_transaction_id is not None:
+                    self.logger.warning("[CONSOLE] Já existe uma sessão ativa.")
                     continue
-                if is_faulted:
-                    logger.warning(
+                if state.is_faulted:
+                    self.logger.warning(
                         "[CONSOLE] Charger em Faulted — rode 'clear' antes "
                         "de iniciar uma nova sessão."
                     )
                     continue
+                if state.availability_status == "Inoperative":
+                    self.logger.warning(
+                        "[CONSOLE] Conector Inoperative (ChangeAvailability do "
+                        "CSMS) — sessão não pode ser iniciada."
+                    )
+                    continue
                 id_tag = parts[1] if len(parts) > 1 else "LOCAL_TAG"
-                logger.info(
+                # Conector reservado: só o id_tag (ou parent_id_tag) da
+                # reserva pode iniciar sessão — qualquer outro é recusado
+                # sem nem chamar Authorize, igual a um charger físico
+                # reservado recusando um RFID errado no totem.
+                if state.reservation_id is not None and id_tag not in (
+                    state.reserved_for_id_tag, state.reserved_parent_id_tag
+                ):
+                    self.logger.warning(
+                        f"[CONSOLE] Conector reservado (reservation_id="
+                        f"{state.reservation_id}) para outro id_tag — "
+                        f"'{id_tag}' recusado."
+                    )
+                    continue
+                self.logger.info(
                     f"[CONSOLE] RFID local: autorizando id_tag='{id_tag}' ..."
                 )
                 asyncio.create_task(
-                    self._local_start_flow(CONNECTOR_ID, id_tag)
+                    self._local_start_flow(self.config.connector_id, id_tag)
                 )
 
             # ── stop ────────────────────────────────────────────────────
-            # Motorista desconectou o cabo ou apertou parar no carro.
-            # Reason.ev_disconnected é diferente de Reason.remote (que é
-            # quando o STOP vem do CSMS via RemoteStopTransaction).
             elif cmd == "stop":
-                if active_transaction_id is None:
-                    logger.warning("[CONSOLE] Nenhuma sessão ativa para encerrar.")
+                if state.active_transaction_id is None:
+                    self.logger.warning("[CONSOLE] Nenhuma sessão ativa para encerrar.")
                     continue
-                logger.info(
+                self.logger.info(
                     f"[CONSOLE] Encerrando sessão pelo cliente "
-                    f"(tx={active_transaction_id})"
+                    f"(tx={state.active_transaction_id})"
                 )
                 asyncio.create_task(
                     self._send_stop_transaction(
-                        active_transaction_id, reason=Reason.ev_disconnected
+                        state.active_transaction_id, reason=Reason.ev_disconnected
                     )
                 )
 
             # ── pause ───────────────────────────────────────────────────
-            # Carro pausou o carregamento (timer do veículo, bateria
-            # aquecendo, etc). StatusNotification → SuspendedEV.
-            # O accumulator para de somar energia enquanto suspenso.
             elif cmd == "pause":
-                if active_transaction_id is None:
-                    logger.warning("[CONSOLE] Nenhuma sessão ativa para pausar.")
+                if state.active_transaction_id is None:
+                    self.logger.warning("[CONSOLE] Nenhuma sessão ativa para pausar.")
                     continue
-                if session_suspended:
-                    logger.warning("[CONSOLE] Sessão já está suspensa.")
+                if state.session_suspended:
+                    self.logger.warning("[CONSOLE] Sessão já está suspensa.")
                     continue
-                session_suspended = True
-                logger.info("⏸️  [CONSOLE] Carregamento pausado → SuspendedEV")
+                state.session_suspended = True
+                self.logger.info("⏸️  [CONSOLE] Carregamento pausado → SuspendedEV")
                 asyncio.create_task(
                     self.send_status_notification(ChargePointStatus.suspended_ev)
                 )
 
             # ── resume ──────────────────────────────────────────────────
-            # Carro retomou o carregamento após pause.
             elif cmd == "resume":
-                if active_transaction_id is None:
-                    logger.warning("[CONSOLE] Nenhuma sessão ativa para retomar.")
+                if state.active_transaction_id is None:
+                    self.logger.warning("[CONSOLE] Nenhuma sessão ativa para retomar.")
                     continue
-                if not session_suspended:
-                    logger.warning("[CONSOLE] Sessão não está suspensa.")
+                if not state.session_suspended:
+                    self.logger.warning("[CONSOLE] Sessão não está suspensa.")
                     continue
-                session_suspended = False
-                logger.info("▶️  [CONSOLE] Carregamento retomado → Charging")
+                state.session_suspended = False
+                self.logger.info("▶️  [CONSOLE] Carregamento retomado → Charging")
                 asyncio.create_task(
                     self.send_status_notification(ChargePointStatus.charging)
                 )
 
             # ── fault <código> ──────────────────────────────────────────
-            # Dispara StatusNotification com Faulted + error code, simulando
-            # uma falha de hardware (ex: fusível queimado, falha de aterramento).
-            # O CSMS deve detectar isso e marcar o conector como indisponível.
             elif cmd == "fault":
                 code_str = parts[1].lower() if len(parts) > 1 else ""
                 error_code = FAULT_CODE_MAP.get(code_str)
                 if error_code is None:
-                    logger.warning(
+                    self.logger.warning(
                         f"[CONSOLE] Código de falha desconhecido: '{code_str}'. "
                         f"Válidos: {', '.join(FAULT_CODE_MAP)}"
                     )
                     continue
-                logger.warning(
+                self.logger.warning(
                     f"[CONSOLE] Simulando falha: {error_code.value}"
                 )
                 asyncio.create_task(
@@ -986,56 +1602,89 @@ class EVChargerSim(BaseChargePoint):
                 )
 
             # ── clear ───────────────────────────────────────────────────
-            # Limpa uma falha simulada e volta para Available. Necessário
-            # depois de um "fault" — um charger físico real não sai de
-            # Faulted sozinho, e sem esse comando o único jeito era matar
-            # e reiniciar o processo inteiro (derrubando a conexão WS).
             elif cmd == "clear":
-                if not is_faulted:
-                    logger.warning("[CONSOLE] Nenhuma falha ativa para limpar.")
+                if not state.is_faulted:
+                    self.logger.warning("[CONSOLE] Nenhuma falha ativa para limpar.")
                     continue
                 asyncio.create_task(self._send_fault_clear())
 
+            # ── datatransfer <vendor_id> [message_id] [data...] ───────────
+            # Envia um DataTransfer do charger PARA o CSMS — útil para
+            # testar o handler DataTransfer do lado do servidor sem
+            # precisar de um evento OCPP padrão que dispare isso sozinho.
+            elif cmd == "datatransfer":
+                if len(parts) < 2:
+                    self.logger.warning(
+                        "[CONSOLE] Uso: datatransfer <vendor_id> [message_id] [data...]"
+                    )
+                    continue
+                vendor_id = parts[1]
+                message_id = parts[2] if len(parts) > 2 else None
+                data = " ".join(parts[3:]) if len(parts) > 3 else None
+                asyncio.create_task(
+                    self._send_data_transfer(vendor_id, message_id, data)
+                )
+
             elif cmd == "help":
-                logger.info(
+                self.logger.info(
                     "[CONSOLE] Comandos:\n"
-                    "  start <id_tag>   — RFID local (Authorize → StartTransaction)\n"
+                    "  start <id_tag>   — RFID local (Authorize/lista local → StartTransaction)\n"
                     "  stop             — cliente encerra sessão (ev_disconnected)\n"
                     "  pause            — carro pausa carregamento (SuspendedEV)\n"
                     "  resume           — carro retoma carregamento (Charging)\n"
                     "  fault <código>   — simula falha de hardware (Faulted)\n"
                     f"  códigos de fault: {', '.join(FAULT_CODE_MAP)}\n"
                     "  clear            — limpa a falha ativa (volta a Available)\n"
-                    "  help             — esta mensagem"
+                    "  datatransfer <vendor_id> [message_id] [data]\n"
+                    "                   — envia DataTransfer para o CSMS\n"
+                    "  help             — esta mensagem\n"
+                    "\n"
+                    "  Reserva (ReserveNow/CancelReservation) e lista local "
+                    "(SendLocalList) são\n"
+                    "  controladas pelo CSMS — 'start' respeita ambas automaticamente."
                 )
             elif cmd:
-                logger.warning(f"[CONSOLE] Comando desconhecido: '{cmd}'. Digite 'help'.")
+                self.logger.warning(f"[CONSOLE] Comando desconhecido: '{cmd}'. Digite 'help'.")
 
     async def _local_start_flow(self, connector_id: int, id_tag: str):
         """
         Fluxo de start iniciado localmente pelo motorista (RFID no totem).
         Diferente do RemoteStart (que vem do CSMS pronto para iniciar):
-        aqui o carregador precisa primeiro pedir autorização ao CSMS via
-        Authorize, e só então iniciar a transação se a resposta for Accepted.
+        aqui o carregador precisa autorizar o id_tag antes de iniciar a
+        transação.
+
+        Se o id_tag estiver na lista local (carregada via SendLocalList),
+        usamos o status de lá direto — sem round-trip nenhum ao CSMS,
+        simulando um charger capaz de autorizar offline/localmente com
+        uma lista pré-carregada. Só cai no Authorize remoto quando o
+        id_tag não está na lista local.
         """
         try:
-            auth_request = call.Authorize(id_tag=id_tag)
-            auth_response = await self.call(auth_request)
-            status = auth_response.id_tag_info.get("status", "Invalid")
+            local_status = self.state.local_auth_list.get(id_tag)
+            if local_status is not None:
+                status = local_status
+                self.logger.info(
+                    f"[LOCAL START] id_tag='{id_tag}' encontrado na lista local "
+                    f"(status={status}) — sem chamada Authorize ao CSMS."
+                )
+            else:
+                auth_request = call.Authorize(id_tag=id_tag)
+                auth_response = await self.call(auth_request)
+                status = auth_response.id_tag_info.get("status", "Invalid")
 
             if status != AuthorizationStatus.accepted:
-                logger.warning(
-                    f"[LOCAL START] id_tag='{id_tag}' não autorizado pelo CSMS "
+                self.logger.warning(
+                    f"[LOCAL START] id_tag='{id_tag}' não autorizado "
                     f"(status={status}). Sessão não iniciada."
                 )
                 return
 
-            logger.info(
+            self.logger.info(
                 f"[LOCAL START] id_tag='{id_tag}' autorizado → iniciando transação"
             )
             await self._send_start_transaction(connector_id, id_tag)
         except Exception:
-            logger.exception("[LOCAL START] Falha no fluxo de autorização local.")
+            self.logger.exception("[LOCAL START] Falha no fluxo de autorização local.")
 
     async def _send_fault_notification(self, error_code: ChargePointErrorCode):
         """
@@ -1044,30 +1693,29 @@ class EVChargerSim(BaseChargePoint):
         um carregador que falha não pode simplesmente continuar a sessão,
         então manda StopTransaction antes de reportar o fault.
         """
-        global current_offered_amps, current_actual_amps, is_faulted
-
-        if active_transaction_id is not None:
-            logger.warning(
-                f"[FAULT] Sessão ativa (tx={active_transaction_id}) será "
+        state = self.state
+        if state.active_transaction_id is not None:
+            self.logger.warning(
+                f"[FAULT] Sessão ativa (tx={state.active_transaction_id}) será "
                 "encerrada pelo fault antes de reportar o erro."
             )
             await self._send_stop_transaction(
-                active_transaction_id,
+                state.active_transaction_id,
                 reason=Reason.other,
                 skip_status_flow=True,
             )
 
-        current_offered_amps = 0.0
-        current_actual_amps = 0.0
-        is_faulted = True
+        state.current_offered_amps = 0.0
+        state.current_actual_amps = 0.0
+        state.is_faulted = True
 
         request = call.StatusNotification(
-            connector_id=CONNECTOR_ID,
+            connector_id=self.config.connector_id,
             error_code=error_code,
             status=ChargePointStatus.faulted,
         )
         await self.call(request)
-        logger.warning(
+        self.logger.warning(
             f"⚠️  [FAULT] StatusNotification enviado: Faulted / {error_code.value} "
             "— use 'clear' para voltar a Available."
         )
@@ -1079,10 +1727,21 @@ class EVChargerSim(BaseChargePoint):
         e reiniciar o processo inteiro, o que também derrubava a conexão
         WebSocket com o CSMS (evento diferente de "falha resolvida").
         """
-        global is_faulted
-        is_faulted = False
+        self.state.is_faulted = False
         await self.send_status_notification(ChargePointStatus.available)
-        logger.info("✅ [FAULT] Falha limpa — charger voltou para Available")
+        self.logger.info("✅ [FAULT] Falha limpa — charger voltou para Available")
+
+    async def _send_data_transfer(self, vendor_id: str, message_id: str | None, data: str | None):
+        """Envia um DataTransfer arbitrário do charger para o CSMS (comando 'datatransfer' do console)."""
+        try:
+            request = call.DataTransfer(vendor_id=vendor_id, message_id=message_id, data=data)
+            response = await self.call(request)
+            self.logger.info(
+                f"[DATA TRANSFER] enviado | vendor_id={vendor_id} → "
+                f"resposta: status={response.status} data={response.data!r}"
+            )
+        except Exception:
+            self.logger.exception("[DATA TRANSFER] Falha ao enviar.")
 
     async def simulate_connection_flow(self):
         """
@@ -1096,7 +1755,7 @@ class EVChargerSim(BaseChargePoint):
         await self.send_status_notification(ChargePointStatus.available)
 
 
-def _print_banner():
+def _print_banner(config: SimConfig):
     """
     Painel de orientação rápida, impresso uma única vez ao ligar o
     simulador (não a cada reconexão) — sem isso, ao abrir o terminal
@@ -1109,43 +1768,42 @@ def _print_banner():
         bar,
         "  EVChargerSim — simulador de Charge Point OCPP 1.6J",
         bar,
-        f"  Charge Point ID   : {CHARGE_POINT_ID}",
-        f"  CSMS              : {CSMS_URL}/{CHARGE_POINT_ID}",
-        f"  Conector          : {CONNECTOR_ID}",
-        f"  Bateria simulada  : {BATTERY_CAPACITY_WH / 1000:.1f} kWh"
-        f" | SoC inicial: {INITIAL_SOC_PERCENT:.0f}%",
-        f"  Heartbeat         : {HEARTBEAT_INTERVAL}s"
-        f" | MeterValues: {METER_VALUES_INTERVAL}s"
-        f" | Corrente padrão: {DEFAULT_OFFERED_AMPS:.0f}A",
+        f"  Charge Point ID   : {config.charge_point_id}",
+        f"  CSMS              : {config.url}/{config.charge_point_id}",
+        f"  Conector          : {config.connector_id}",
+        f"  Bateria simulada  : {config.battery_capacity_wh / 1000:.1f} kWh"
+        f" | SoC inicial: {config.initial_soc_percent:.0f}%",
+        f"  Heartbeat         : {config.heartbeat_interval}s"
+        f" | MeterValues: {config.meter_values_interval}s"
+        f" | Corrente padrão: {config.default_offered_amps:.0f}A",
         bar,
     ]
-    if _USE_COLOR:
+    if sys.stdout.isatty():
         cyan, reset = "\033[36m", "\033[0m"
         lines = [f"{cyan}{line}{reset}" for line in lines]
     print("\n".join(lines))
 
 
-async def _run_session():
+async def _run_session(config: SimConfig, logger: logging.Logger):
     """
     Uma única tentativa de conexão + sessão completa com o CSMS. Se a
     conexão cair (ou nunca se estabelecer), a exceção sobe para quem
     chamou decidir se tenta de novo — ver main().
     """
-    url = f"{CSMS_URL}/{CHARGE_POINT_ID}"
+    url = f"{config.url}/{config.charge_point_id}"
     logger.info(f"Conectando em {url} ...")
 
     async with websockets.connect(url, subprotocols=["ocpp1.6"]) as ws:
         logger.info("🔌 Conectado ao CSMS")
-        cp = EVChargerSim(CHARGE_POINT_ID, ws)
+        cp = EVChargerSim(config.charge_point_id, ws, config, logger)
 
         # Roda o "listener" do protocolo (escuta mensagens do CSMS) em paralelo
         # com as rotinas de envio (boot, status, heartbeat, meter values).
         #
         # Nota: console_command_loop é recriado a cada (re)conexão. O
         # input() dele roda numa thread do executor padrão que não pode
-        # ser cancelada de verdade (mesma limitação documentada em
-        # logging_setupEV.async_input) — numa reconexão ela fica parada
-        # em segundo plano até o usuário digitar algo, e só então é
+        # ser cancelada de verdade — numa reconexão ela fica parada em
+        # segundo plano até o usuário digitar algo, e só então é
         # descartada. Inofensivo no uso normal (algumas reconexões
         # durante um teste manual); não é pensado para reconectar em
         # loop rápido e indefinido sem nunca reiniciar o processo.
@@ -1153,28 +1811,30 @@ async def _run_session():
             cp.start(),
             cp.simulate_connection_flow(),
             cp.send_heartbeat_loop(),
-            cp.send_meter_values_loop(interval_seconds=METER_VALUES_INTERVAL),
-            cp.energy_accumulator_loop(interval_seconds=METER_VALUES_INTERVAL),
+            cp.send_meter_values_loop(interval_seconds=config.meter_values_interval),
+            cp.energy_accumulator_loop(interval_seconds=config.meter_values_interval),
             cp.console_command_loop(),
         )
 
 
-async def main():
+async def main(argv=None):
     """
     Loop de reconexão com backoff exponencial (2s -> 4s -> 8s ... até um
     teto de 30s, resetando assim que uma conexão fica de pé com sucesso).
-    Espelha o comportamento de um charger físico real — e do próprio
-    CSMS (ver start_sync_loop em charger.py): se o servidor cair ou
-    ainda não estiver no ar, tenta de novo em vez de derrubar o
+    Espelha o comportamento de um charger físico real — se o servidor
+    cair ou ainda não estiver no ar, tenta de novo em vez de derrubar o
     processo. Sem isso, testar cenários de reconexão no dashboard exigia
     rodar o script manualmente de novo a cada queda.
     """
-    _print_banner()
+    config = SimConfig.load(argv)
+    logger = build_logger(config.charge_point_id, config.verbose)
+
+    _print_banner(config)
     backoff = 2
     max_backoff = 30
     while True:
         try:
-            await _run_session()
+            await _run_session(config, logger)
             logger.warning("Conexão encerrada pelo CSMS — tentando reconectar...")
             backoff = 2
         except (OSError, asyncio.TimeoutError,
@@ -1197,4 +1857,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Simulador encerrado manualmente.")
+        logging.getLogger("evchargersim").info("Simulador encerrado manualmente.")
