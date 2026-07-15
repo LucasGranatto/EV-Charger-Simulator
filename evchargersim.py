@@ -450,17 +450,6 @@ def compute_actual_current(offered_amps: float, soc_percent: float) -> float:
     return round(offered_amps * factor, 1)
 
 
-def _soc_bar(soc_percent: float, width: int = 10) -> str:
-    """
-    Barra de progresso ASCII do SoC da bateria, tipo [██████░░░░] 62% —
-    mais fácil de captar de relance do que só o número, especialmente
-    útil pra notar visualmente o "tapering" (corrente caindo) perto do
-    fim da barra sem precisar fazer a conta de cabeça.
-    """
-    filled = max(0, min(width, round(soc_percent / 100 * width)))
-    return f"[{'█' * filled}{'░' * (width - filled)}] {soc_percent:5.1f}%"
-
-
 def _meter_line_color(has_session: bool, suspended: bool, faulted: bool, use_color: bool) -> str:
     """
     Cor da linha de MeterValues conforme o estado atual do charger —
@@ -490,7 +479,21 @@ class EVChargerSim(BaseChargePoint):
     def __init__(self, charge_point_id, connection, config: SimConfig, logger: logging.Logger):
         super().__init__(charge_point_id, connection)
         self.config = config
-        self.logger = logger
+        # IMPORTANTE: NÃO usar o nome `self.logger` aqui — BaseChargePoint
+        # já usa esse atributo internamente (default: logging.getLogger
+        # ("ocpp")) para logar CADA mensagem OCPP crua enviada/recebida
+        # ("%s: receive message %s" / "%s: send %s" em charge_point.py da
+        # lib). Um bug real aconteceu aqui antes: sobrescrever
+        # self.logger com o logger deste módulo fazia com que essas
+        # mensagens brutas passassem a sair pelo NOSSO logger — que não
+        # está suprimido — em vez do logger "ocpp" (que build_logger()
+        # sobe para WARNING de propósito). Resultado: o terminal enchia
+        # de JSON cru de novo mesmo com build_logger() aparentemente
+        # correto, porque a supressão em "ocpp" não tinha mais efeito
+        # nenhum sobre essas chamadas. Por isso o atributo aqui se chama
+        # `self.log`, não `self.logger` — e todo o resto da classe
+        # também usa `self.log`, nunca `self.logger`.
+        self.log = logger
         self.state = ChargerState(
             battery_soc_percent=config.initial_soc_percent,
             current_heartbeat_interval=config.heartbeat_interval,
@@ -524,7 +527,7 @@ class EVChargerSim(BaseChargePoint):
         if unit == "W":
             return round(limit / self.config.nominal_voltage, 2)
         if unit and unit != "A":
-            self.logger.warning(
+            self.log.warning(
                 f"[PERFIL RECEBIDO] chargingRateUnit desconhecido '{unit}' — "
                 "tratando como amperes (A)."
             )
@@ -549,7 +552,7 @@ class EVChargerSim(BaseChargePoint):
         state.current_actual_amps = compute_actual_current(
             offered_amps, state.battery_soc_percent
         )
-        self.logger.info(
+        self.log.info(
             f"[{source}] limite oferecido={state.current_offered_amps}A | "
             f"corrente real (SoC {state.battery_soc_percent:.0f}%)={state.current_actual_amps}A"
         )
@@ -565,12 +568,12 @@ class EVChargerSim(BaseChargePoint):
         if state.active_transaction_id is not None and not state.session_suspended:
             if state.current_offered_amps <= 0.0 and not state.evse_suspended_by_profile:
                 state.evse_suspended_by_profile = True
-                self.logger.info(f"[{source}] 0A imposto pelo CSMS → SuspendedEVSE")
+                self.log.info(f"[{source}] 0A imposto pelo CSMS → SuspendedEVSE")
                 asyncio.create_task(self.send_status_notification(
                     ChargePointStatus.suspended_evse))
             elif state.current_offered_amps > 0.0 and state.evse_suspended_by_profile:
                 state.evse_suspended_by_profile = False
-                self.logger.info(f"[{source}] corrente restaurada pelo CSMS → Charging")
+                self.log.info(f"[{source}] corrente restaurada pelo CSMS → Charging")
                 asyncio.create_task(self.send_status_notification(
                     ChargePointStatus.charging))
 
@@ -603,7 +606,7 @@ class EVChargerSim(BaseChargePoint):
                     )
                     wait = max(0, next_start - start_period)
                     if wait > 0:
-                        self.logger.info(
+                        self.log.info(
                             f"[PERFIL RECEBIDO] período atual válido por {wait}s "
                             f"antes do próximo degrau do perfil"
                         )
@@ -628,7 +631,7 @@ class EVChargerSim(BaseChargePoint):
         self._cancel_profile_task()
 
         if periods:
-            self.logger.info(
+            self.log.info(
                 f"[PERFIL RECEBIDO] connector={connector_id} | "
                 f"{len(periods)} período(s) | unidade={unit}"
             )
@@ -636,7 +639,7 @@ class EVChargerSim(BaseChargePoint):
                 self._run_charging_schedule(periods, unit)
             )
         else:
-            self.logger.warning("SetChargingProfile recebido sem chargingSchedulePeriod")
+            self.log.warning("SetChargingProfile recebido sem chargingSchedulePeriod")
 
         return call_result.SetChargingProfile(status="Accepted")
 
@@ -657,7 +660,7 @@ class EVChargerSim(BaseChargePoint):
             self.config.default_offered_amps if state.active_transaction_id is not None else 0.0
         )
         self._apply_offered_amps(fallback_amps, source="PERFIL LIMPO")
-        self.logger.info(
+        self.log.info(
             "[CLEAR CHARGING PROFILE] perfil removido — voltando à corrente "
             f"padrão ({fallback_amps:.0f}A)"
         )
@@ -665,19 +668,19 @@ class EVChargerSim(BaseChargePoint):
 
     @on(Action.remote_start_transaction)
     async def on_remote_start_transaction(self, id_tag, connector_id=None, **kwargs):
-        self.logger.info(f"[REMOTE START] id_tag={id_tag} connector={connector_id}")
+        self.log.info(f"[REMOTE START] id_tag={id_tag} connector={connector_id}")
         state = self.state
 
         if state.availability_status == "Inoperative":
-            self.logger.warning(
+            self.log.warning(
                 "[REMOTE START] conector Inoperative (ChangeAvailability) — recusando."
             )
             return call_result.RemoteStartTransaction(status=RemoteStartStopStatus.rejected)
         if state.active_transaction_id is not None:
-            self.logger.warning("[REMOTE START] já existe sessão ativa — recusando.")
+            self.log.warning("[REMOTE START] já existe sessão ativa — recusando.")
             return call_result.RemoteStartTransaction(status=RemoteStartStopStatus.rejected)
         if state.is_faulted:
-            self.logger.warning("[REMOTE START] charger em Faulted — recusando.")
+            self.log.warning("[REMOTE START] charger em Faulted — recusando.")
             return call_result.RemoteStartTransaction(status=RemoteStartStopStatus.rejected)
 
         # Dispara o envio de StartTransaction em background, DEPOIS de responder
@@ -691,7 +694,7 @@ class EVChargerSim(BaseChargePoint):
 
     @on(Action.remote_stop_transaction)
     async def on_remote_stop_transaction(self, transaction_id, **kwargs):
-        self.logger.info(f"[REMOTE STOP] transaction_id={transaction_id}")
+        self.log.info(f"[REMOTE STOP] transaction_id={transaction_id}")
         # Reason.remote é o motivo correto da OCPP para uma sessão encerrada
         # via comando remoto do CSMS (botão "Parar" no dashboard) — sem
         # isso, o campo "reason" ia como None/nulo, e o histórico de
@@ -716,13 +719,13 @@ class EVChargerSim(BaseChargePoint):
         Operative sempre aplica na hora (cancela um Scheduled pendente,
         se houver) e volta a Available.
         """
-        self.logger.info(f"[CHANGE AVAILABILITY] connector={connector_id} type={type}")
+        self.log.info(f"[CHANGE AVAILABILITY] connector={connector_id} type={type}")
         state = self.state
 
         if type == AvailabilityType.inoperative:
             if state.active_transaction_id is not None:
                 state.pending_availability_change = "Inoperative"
-                self.logger.info(
+                self.log.info(
                     "[CHANGE AVAILABILITY] sessão ativa — mudança para "
                     "Inoperative agendada para quando a sessão terminar."
                 )
@@ -753,13 +756,13 @@ class EVChargerSim(BaseChargePoint):
         um período maior de indisponibilidade (Unavailable) representando
         o boot do firmware, antes de voltar a Available.
         """
-        self.logger.info(f"[RESET] type={type}")
+        self.log.info(f"[RESET] type={type}")
         is_hard = (type == ResetType.hard)
         reason = Reason.hard_reset if is_hard else Reason.soft_reset
 
         active_id = self.state.active_transaction_id
         if active_id is not None:
-            self.logger.info(
+            self.log.info(
                 f"[RESET] sessão ativa (tx={active_id}) será "
                 f"interrompida pelo reset"
             )
@@ -782,16 +785,16 @@ class EVChargerSim(BaseChargePoint):
             # Hard reset: simula o carregador caindo (Unavailable) durante
             # o boot do firmware antes de voltar a responder normalmente.
             await self.send_status_notification(ChargePointStatus.unavailable)
-            self.logger.info("[RESET] hard reset — simulando reboot do firmware (5s)...")
+            self.log.info("[RESET] hard reset — simulando reboot do firmware (5s)...")
             await asyncio.sleep(5)
             await self.send_boot_notification()
             await asyncio.sleep(1)
         else:
-            self.logger.info("[RESET] soft reset — reinício rápido do software (1s)...")
+            self.log.info("[RESET] soft reset — reinício rápido do software (1s)...")
             await asyncio.sleep(1)
 
         await self.send_status_notification(ChargePointStatus.available)
-        self.logger.info("[RESET] concluído — carregador disponível novamente")
+        self.log.info("[RESET] concluído — carregador disponível novamente")
 
     @on(Action.trigger_message)
     async def on_trigger_message(self, requested_message, connector_id=None, **kwargs):
@@ -800,7 +803,7 @@ class EVChargerSim(BaseChargePoint):
         espontaneamente (ex: StatusNotification, Heartbeat). Usado pelo
         status_check() do CSMS real para forçar uma atualização de estado.
         """
-        self.logger.info(f"[TRIGGER MESSAGE] requested={requested_message} connector={connector_id}")
+        self.log.info(f"[TRIGGER MESSAGE] requested={requested_message} connector={connector_id}")
         if requested_message == "StatusNotification":
             current_status = (
                 ChargePointStatus.charging if self.state.active_transaction_id is not None
@@ -835,7 +838,7 @@ class EVChargerSim(BaseChargePoint):
         # HeartbeatInterval e o limite físico — mesmo padrão de ruído
         # periódico do Heartbeat, sem informação nova na maioria dos
         # ciclos. Só aparece no terminal com --verbose.
-        self.logger.debug(f"[GET CONFIGURATION] keys solicitadas={key}")
+        self.log.debug(f"[GET CONFIGURATION] keys solicitadas={key}")
         all_config = [
             {"key": "HeartbeatInterval", "readonly": False,
              "value": str(self.state.current_heartbeat_interval)},
@@ -869,17 +872,17 @@ class EVChargerSim(BaseChargePoint):
 
     @on(Action.change_configuration)
     async def on_change_configuration(self, key, value, **kwargs):
-        self.logger.info(f"[CHANGE CONFIGURATION] key={key} value={value}")
+        self.log.info(f"[CHANGE CONFIGURATION] key={key} value={value}")
 
         if key == "HeartbeatInterval":
             try:
                 self.state.current_heartbeat_interval = int(value)
-                self.logger.info(
+                self.log.info(
                     f"[HEARTBEAT] intervalo atualizado para "
                     f"{self.state.current_heartbeat_interval}s — efeito no próximo ciclo"
                 )
             except ValueError:
-                self.logger.warning(f"[CHANGE CONFIGURATION] valor inválido para HeartbeatInterval: {value}")
+                self.log.warning(f"[CHANGE CONFIGURATION] valor inválido para HeartbeatInterval: {value}")
                 return call_result.ChangeConfiguration(status="Rejected")
         # Outras chaves (ex: MeterValueSampleInterval) são aceitas mas não
         # têm efeito simulado — o intervalo de MeterValues deste simulador
@@ -898,7 +901,7 @@ class EVChargerSim(BaseChargePoint):
         a lib respondia um NotImplemented genérico pra qualquer CSMS que
         testasse esse fluxo.
         """
-        self.logger.info(f"[UNLOCK CONNECTOR] connector={connector_id}")
+        self.log.info(f"[UNLOCK CONNECTOR] connector={connector_id}")
         if self.state.active_transaction_id is not None:
             # Comportamento simplificado: um charger físico real pode
             # recusar (UnlockFailed) se o EV ainda estiver puxando
@@ -906,7 +909,7 @@ class EVChargerSim(BaseChargePoint):
             # hardware. Aqui só avisamos no log e reportamos sucesso —
             # não paramos a sessão automaticamente, já que UnlockConnector
             # não é, por si só, um pedido de StopTransaction.
-            self.logger.warning(
+            self.log.warning(
                 "[UNLOCK CONNECTOR] há uma sessão ativa — destravando o "
                 "conector sem encerrar a sessão (comportamento simplificado)."
             )
@@ -921,7 +924,7 @@ class EVChargerSim(BaseChargePoint):
         confirmar que o transporte ida-e-volta funciona); qualquer outro
         vendor_id recebe UnknownVendorId, como manda o spec.
         """
-        self.logger.info(
+        self.log.info(
             f"[DATA TRANSFER] recebido | vendor_id={vendor_id} "
             f"message_id={message_id} data={data!r}"
         )
@@ -938,17 +941,17 @@ class EVChargerSim(BaseChargePoint):
         suficiente pra testar se o CSMS reage certo às notificações.
         """
         file_name = f"diagnostics_{self.config.charge_point_id}_{int(datetime.now(timezone.utc).timestamp())}.zip"
-        self.logger.info(f"[GET DIAGNOSTICS] location={location} | arquivo simulado: {file_name}")
+        self.log.info(f"[GET DIAGNOSTICS] location={location} | arquivo simulado: {file_name}")
         asyncio.create_task(self._simulate_diagnostics_upload())
         return call_result.GetDiagnostics(file_name=file_name)
 
     async def _simulate_diagnostics_upload(self):
         await asyncio.sleep(1)
         await self.call(call.DiagnosticsStatusNotification(status=DiagnosticsStatus.uploading))
-        self.logger.info("[DIAGNOSTICS] status: Uploading")
+        self.log.info("[DIAGNOSTICS] status: Uploading")
         await asyncio.sleep(2)
         await self.call(call.DiagnosticsStatusNotification(status=DiagnosticsStatus.uploaded))
-        self.logger.info("[DIAGNOSTICS] status: Uploaded")
+        self.log.info("[DIAGNOSTICS] status: Uploaded")
 
     @on(Action.update_firmware)
     async def on_update_firmware(self, location, retrieve_date, **kwargs):
@@ -958,14 +961,14 @@ class EVChargerSim(BaseChargePoint):
         replicamos isso encerrando a transação antes da sequência de
         download/instalação, igual ao hard reset.
         """
-        self.logger.info(f"[UPDATE FIRMWARE] location={location} retrieve_date={retrieve_date}")
+        self.log.info(f"[UPDATE FIRMWARE] location={location} retrieve_date={retrieve_date}")
         asyncio.create_task(self._simulate_firmware_update())
         return call_result.UpdateFirmware()
 
     async def _simulate_firmware_update(self):
         state = self.state
         if state.active_transaction_id is not None:
-            self.logger.warning(
+            self.log.warning(
                 f"[FIRMWARE] sessão ativa (tx={state.active_transaction_id}) será "
                 "encerrada — o firmware update vai reiniciar o charger."
             )
@@ -979,7 +982,7 @@ class EVChargerSim(BaseChargePoint):
             (FirmwareStatus.installing, 1),
         ):
             await self.call(call.FirmwareStatusNotification(status=status))
-            self.logger.info(f"[FIRMWARE] status: {status.value}")
+            self.log.info(f"[FIRMWARE] status: {status.value}")
             await asyncio.sleep(delay)
 
         # Reboot simulado, mesma sequência do hard reset.
@@ -990,7 +993,7 @@ class EVChargerSim(BaseChargePoint):
         await self.send_status_notification(ChargePointStatus.available)
 
         await self.call(call.FirmwareStatusNotification(status=FirmwareStatus.installed))
-        self.logger.info("[FIRMWARE] status: Installed — atualização concluída")
+        self.log.info("[FIRMWARE] status: Installed — atualização concluída")
 
     @on(Action.reserve_now)
     async def on_reserve_now(
@@ -1002,7 +1005,7 @@ class EVChargerSim(BaseChargePoint):
         aceita esse id_tag — ver console_command_loop.
         """
         state = self.state
-        self.logger.info(
+        self.log.info(
             f"[RESERVE NOW] connector={connector_id} id_tag={id_tag} "
             f"reservation_id={reservation_id} expiry={expiry_date}"
         )
@@ -1010,7 +1013,7 @@ class EVChargerSim(BaseChargePoint):
         if state.is_faulted:
             return call_result.ReserveNow(status=ReservationStatus.faulted)
         if state.active_transaction_id is not None or state.reservation_id is not None:
-            self.logger.warning(
+            self.log.warning(
                 "[RESERVE NOW] conector já ocupado (sessão ativa ou já "
                 "reservado) — rejeitando com Occupied."
             )
@@ -1033,7 +1036,7 @@ class EVChargerSim(BaseChargePoint):
             expiry = datetime.fromisoformat(expiry_date.replace("Z", "+00:00"))
             delay = (expiry - datetime.now(timezone.utc)).total_seconds()
         except ValueError:
-            self.logger.warning(
+            self.log.warning(
                 f"[RESERVE NOW] expiry_date inválido/não-ISO8601 ('{expiry_date}') — "
                 "reserva não expira automaticamente, só via CancelReservation."
             )
@@ -1044,7 +1047,7 @@ class EVChargerSim(BaseChargePoint):
 
         state = self.state
         if state.reservation_id == reservation_id:
-            self.logger.info(f"[RESERVE NOW] reserva {reservation_id} expirou sem uso")
+            self.log.info(f"[RESERVE NOW] reserva {reservation_id} expirou sem uso")
             state.reservation_id = None
             state.reserved_for_id_tag = None
             state.reserved_parent_id_tag = None
@@ -1054,7 +1057,7 @@ class EVChargerSim(BaseChargePoint):
     @on(Action.cancel_reservation)
     async def on_cancel_reservation(self, reservation_id, **kwargs):
         state = self.state
-        self.logger.info(f"[CANCEL RESERVATION] reservation_id={reservation_id}")
+        self.log.info(f"[CANCEL RESERVATION] reservation_id={reservation_id}")
         if state.reservation_id != reservation_id:
             return call_result.CancelReservation(status=CancelReservationStatus.rejected)
 
@@ -1067,7 +1070,7 @@ class EVChargerSim(BaseChargePoint):
 
     @on(Action.get_local_list_version)
     async def on_get_local_list_version(self, **kwargs):
-        self.logger.debug(f"[GET LOCAL LIST VERSION] atual={self.state.local_list_version}")
+        self.log.debug(f"[GET LOCAL LIST VERSION] atual={self.state.local_list_version}")
         return call_result.GetLocalListVersion(list_version=self.state.local_list_version)
 
     @on(Action.send_local_list)
@@ -1097,7 +1100,7 @@ class EVChargerSim(BaseChargePoint):
             state.local_auth_list[entry_id_tag] = id_tag_info.get("status", "Accepted")
 
         state.local_list_version = list_version
-        self.logger.info(
+        self.log.info(
             f"[SEND LOCAL LIST] update_type={update_type} | "
             f"nova versão={list_version} | {len(state.local_auth_list)} id_tag(s) na lista"
         )
@@ -1114,7 +1117,7 @@ class EVChargerSim(BaseChargePoint):
         # sessão de simulador anterior (ex: depois de uma reconexão
         # automática).
         self.state.is_faulted = False
-        self.logger.info(f"[BATERIA] SoC inicial: {_soc_bar(self.state.battery_soc_percent)}")
+        self.log.info(f"[BATERIA] SoC inicial: {self.state.battery_soc_percent:.1f}%")
 
         request = call.BootNotification(
             charge_point_model="EVChargerSim",
@@ -1123,9 +1126,9 @@ class EVChargerSim(BaseChargePoint):
         )
         response = await self.call(request)
         if response.status == RegistrationStatus.accepted:
-            self.logger.info("BootNotification aceito pelo CSMS.")
+            self.log.info("BootNotification aceito pelo CSMS.")
         else:
-            self.logger.warning(f"BootNotification respondido com status: {response.status}")
+            self.log.warning(f"BootNotification respondido com status: {response.status}")
 
     async def send_status_notification(self, status: str):
         request = call.StatusNotification(
@@ -1134,7 +1137,7 @@ class EVChargerSim(BaseChargePoint):
             status=status,
         )
         await self.call(request)
-        self.logger.info(f"StatusNotification enviado: {status}")
+        self.log.info(f"StatusNotification enviado: {status}")
 
     async def _send_start_transaction(self, connector_id: int, id_tag: str):
         """
@@ -1156,7 +1159,7 @@ class EVChargerSim(BaseChargePoint):
             state.battery_soc_percent = self.config.initial_soc_percent
             state.energy_meter_wh = 0.0
             state.session_suspended = False
-            self.logger.info(f"[BATERIA] SoC inicial desta sessão: {_soc_bar(state.battery_soc_percent)}")
+            self.log.info(f"[BATERIA] SoC inicial desta sessão: {state.battery_soc_percent:.1f}%")
 
             # Aplica a corrente padrão residencial imediatamente, antes de
             # qualquer SetChargingProfile chegar do CSMS. Sem isso, a sessão
@@ -1168,7 +1171,7 @@ class EVChargerSim(BaseChargePoint):
             state.current_actual_amps = compute_actual_current(
                 state.current_offered_amps, state.battery_soc_percent
             )
-            self.logger.info(
+            self.log.info(
                 f"[SESSION] Corrente inicial: {state.current_offered_amps:.0f}A oferecido "
                 f"/ {state.current_actual_amps:.1f}A real (aguardando SetChargingProfile do CSMS)"
             )
@@ -1193,7 +1196,7 @@ class EVChargerSim(BaseChargePoint):
                 self.call(request), timeout=self.config.call_timeout_seconds
             )
             state.active_transaction_id = response.transaction_id
-            self.logger.info(
+            self.log.info(
                 f"⚡ [START TRANSACTION] aceito pelo CSMS | "
                 f"transaction_id={state.active_transaction_id} | id_tag={id_tag}"
             )
@@ -1202,7 +1205,7 @@ class EVChargerSim(BaseChargePoint):
             # houver uma — um charger físico real libera a reserva assim
             # que o id_tag correto é usado, não só quando ela expira.
             if state.reservation_id is not None:
-                self.logger.info(
+                self.log.info(
                     f"[SESSION] reserva {state.reservation_id} consumida pelo início desta sessão"
                 )
                 state.reservation_id = None
@@ -1217,7 +1220,7 @@ class EVChargerSim(BaseChargePoint):
 
             await self.send_status_notification(ChargePointStatus.charging)
         except asyncio.TimeoutError:
-            self.logger.error(
+            self.log.error(
                 f"[START TRANSACTION] CSMS não respondeu em "
                 f"{self.config.call_timeout_seconds}s — sessão NÃO foi "
                 "registrada. Verifique se o CSMS está processando mensagens."
@@ -1226,7 +1229,7 @@ class EVChargerSim(BaseChargePoint):
             # Sem isso, uma falha aqui (ex: conexão caiu nesse meio tempo)
             # morre silenciosamente — a task roda em segundo plano via
             # create_task e ninguém nunca dá "await" nela para propagar o erro.
-            self.logger.exception(
+            self.log.exception(
                 "[START TRANSACTION] FALHOU ao enviar — sessão NÃO foi "
                 "registrada no CSMS. Verifique se a conexão ainda está ativa."
             )
@@ -1268,7 +1271,7 @@ class EVChargerSim(BaseChargePoint):
             await asyncio.wait_for(
                 self.call(request), timeout=self.config.call_timeout_seconds
             )
-            self.logger.info(
+            self.log.info(
                 f"🛑 [STOP TRANSACTION] enviado | transaction_id={transaction_id}"
                 + (f" | motivo={reason.value}" if reason else "")
             )
@@ -1288,7 +1291,7 @@ class EVChargerSim(BaseChargePoint):
                 # e ela ser sobrescrita um instante depois pelo Available
                 # final do reset.
                 if state.pending_availability_change is not None:
-                    self.logger.warning(
+                    self.log.warning(
                         "[CHANGE AVAILABILITY] mudança para Inoperative estava "
                         "agendada, mas a sessão terminou via reset/fault/firmware "
                         "(sequência de status própria) — reenvie ChangeAvailability "
@@ -1302,7 +1305,7 @@ class EVChargerSim(BaseChargePoint):
             if state.pending_availability_change == "Inoperative":
                 state.availability_status = "Inoperative"
                 state.pending_availability_change = None
-                self.logger.info(
+                self.log.info(
                     "[CHANGE AVAILABILITY] aplicando mudança para Inoperative "
                     "agendada, agora que a sessão terminou."
                 )
@@ -1319,7 +1322,7 @@ class EVChargerSim(BaseChargePoint):
             await asyncio.sleep(2)
             await self.send_status_notification(ChargePointStatus.available)
         except asyncio.TimeoutError:
-            self.logger.error(
+            self.log.error(
                 f"[STOP TRANSACTION] CSMS não respondeu em "
                 f"{self.config.call_timeout_seconds}s — a sessão "
                 f"(transaction_id={transaction_id}) vai continuar 'pendurada' "
@@ -1329,7 +1332,7 @@ class EVChargerSim(BaseChargePoint):
             # Mesmo cuidado do _send_start_transaction: sem isso, a sessão
             # fica "pendurada" no banco (started_at preenchido, stopped_at
             # nulo para sempre) sem nenhum aviso de que algo falhou.
-            self.logger.exception(
+            self.log.exception(
                 "[STOP TRANSACTION] FALHOU ao enviar — a sessão "
                 f"(transaction_id={transaction_id}) vai continuar 'pendurada' "
                 "como ativa no banco de dados até ser encerrada manualmente."
@@ -1377,7 +1380,7 @@ class EVChargerSim(BaseChargePoint):
 
             if state.battery_soc_percent >= 100.0:
                 state.current_actual_amps = 0.0
-                self.logger.info(
+                self.log.info(
                     "[BATERIA] SoC atingiu 100% — EV sinalizou bateria cheia. "
                     "Encerrando sessão automaticamente (Reason.ev_disconnected)."
                 )
@@ -1399,7 +1402,7 @@ class EVChargerSim(BaseChargePoint):
             # DEBUG, não INFO: essa linha nunca traz informação nova (é
             # literalmente "ainda estou vivo" a cada ciclo) — só aparece
             # no terminal com --verbose.
-            self.logger.debug(
+            self.log.debug(
                 f"Heartbeat enviado (intervalo atual: {self.state.current_heartbeat_interval}s)."
             )
             await asyncio.sleep(self.state.current_heartbeat_interval)
@@ -1468,13 +1471,13 @@ class EVChargerSim(BaseChargePoint):
             # sessão (SoC, corrente, potência), então vale ficar visível
             # sem precisar de --verbose.
             if has_session:
-                self.logger.info(
-                    f"{color}🔋 {_soc_bar(state.battery_soc_percent)}  "
+                self.log.info(
+                    f"{color}🔋 SoC {state.battery_soc_percent:5.1f}%  "
                     f"⚡ {state.current_actual_amps:4.1f}/{state.current_offered_amps:4.1f}A  "
                     f"{power_kw:5.2f}kW  Σ{energy_kwh:6.2f}kWh{reset}"
                 )
             else:
-                self.logger.info(f"{color}🔋 sem sessão ativa{reset}")
+                self.log.info(f"{color}🔋 sem sessão ativa{reset}")
 
             await asyncio.sleep(interval_seconds)
 
@@ -1487,7 +1490,7 @@ class EVChargerSim(BaseChargePoint):
         """
         state = self.state
         loop = asyncio.get_running_loop()
-        self.logger.info(
+        self.log.info(
             "[CONSOLE] Pronto. Comandos: start <id_tag> | stop | pause | "
             "resume | fault <código> | clear | datatransfer | help"
         )
@@ -1506,16 +1509,16 @@ class EVChargerSim(BaseChargePoint):
             # ── start <id_tag> ──────────────────────────────────────────
             if cmd == "start":
                 if state.active_transaction_id is not None:
-                    self.logger.warning("[CONSOLE] Já existe uma sessão ativa.")
+                    self.log.warning("[CONSOLE] Já existe uma sessão ativa.")
                     continue
                 if state.is_faulted:
-                    self.logger.warning(
+                    self.log.warning(
                         "[CONSOLE] Charger em Faulted — rode 'clear' antes "
                         "de iniciar uma nova sessão."
                     )
                     continue
                 if state.availability_status == "Inoperative":
-                    self.logger.warning(
+                    self.log.warning(
                         "[CONSOLE] Conector Inoperative (ChangeAvailability do "
                         "CSMS) — sessão não pode ser iniciada."
                     )
@@ -1528,13 +1531,13 @@ class EVChargerSim(BaseChargePoint):
                 if state.reservation_id is not None and id_tag not in (
                     state.reserved_for_id_tag, state.reserved_parent_id_tag
                 ):
-                    self.logger.warning(
+                    self.log.warning(
                         f"[CONSOLE] Conector reservado (reservation_id="
                         f"{state.reservation_id}) para outro id_tag — "
                         f"'{id_tag}' recusado."
                     )
                     continue
-                self.logger.info(
+                self.log.info(
                     f"[CONSOLE] RFID local: autorizando id_tag='{id_tag}' ..."
                 )
                 asyncio.create_task(
@@ -1544,9 +1547,9 @@ class EVChargerSim(BaseChargePoint):
             # ── stop ────────────────────────────────────────────────────
             elif cmd == "stop":
                 if state.active_transaction_id is None:
-                    self.logger.warning("[CONSOLE] Nenhuma sessão ativa para encerrar.")
+                    self.log.warning("[CONSOLE] Nenhuma sessão ativa para encerrar.")
                     continue
-                self.logger.info(
+                self.log.info(
                     f"[CONSOLE] Encerrando sessão pelo cliente "
                     f"(tx={state.active_transaction_id})"
                 )
@@ -1559,13 +1562,13 @@ class EVChargerSim(BaseChargePoint):
             # ── pause ───────────────────────────────────────────────────
             elif cmd == "pause":
                 if state.active_transaction_id is None:
-                    self.logger.warning("[CONSOLE] Nenhuma sessão ativa para pausar.")
+                    self.log.warning("[CONSOLE] Nenhuma sessão ativa para pausar.")
                     continue
                 if state.session_suspended:
-                    self.logger.warning("[CONSOLE] Sessão já está suspensa.")
+                    self.log.warning("[CONSOLE] Sessão já está suspensa.")
                     continue
                 state.session_suspended = True
-                self.logger.info("⏸️  [CONSOLE] Carregamento pausado → SuspendedEV")
+                self.log.info("⏸️  [CONSOLE] Carregamento pausado → SuspendedEV")
                 asyncio.create_task(
                     self.send_status_notification(ChargePointStatus.suspended_ev)
                 )
@@ -1573,13 +1576,13 @@ class EVChargerSim(BaseChargePoint):
             # ── resume ──────────────────────────────────────────────────
             elif cmd == "resume":
                 if state.active_transaction_id is None:
-                    self.logger.warning("[CONSOLE] Nenhuma sessão ativa para retomar.")
+                    self.log.warning("[CONSOLE] Nenhuma sessão ativa para retomar.")
                     continue
                 if not state.session_suspended:
-                    self.logger.warning("[CONSOLE] Sessão não está suspensa.")
+                    self.log.warning("[CONSOLE] Sessão não está suspensa.")
                     continue
                 state.session_suspended = False
-                self.logger.info("▶️  [CONSOLE] Carregamento retomado → Charging")
+                self.log.info("▶️  [CONSOLE] Carregamento retomado → Charging")
                 asyncio.create_task(
                     self.send_status_notification(ChargePointStatus.charging)
                 )
@@ -1589,12 +1592,12 @@ class EVChargerSim(BaseChargePoint):
                 code_str = parts[1].lower() if len(parts) > 1 else ""
                 error_code = FAULT_CODE_MAP.get(code_str)
                 if error_code is None:
-                    self.logger.warning(
+                    self.log.warning(
                         f"[CONSOLE] Código de falha desconhecido: '{code_str}'. "
                         f"Válidos: {', '.join(FAULT_CODE_MAP)}"
                     )
                     continue
-                self.logger.warning(
+                self.log.warning(
                     f"[CONSOLE] Simulando falha: {error_code.value}"
                 )
                 asyncio.create_task(
@@ -1604,7 +1607,7 @@ class EVChargerSim(BaseChargePoint):
             # ── clear ───────────────────────────────────────────────────
             elif cmd == "clear":
                 if not state.is_faulted:
-                    self.logger.warning("[CONSOLE] Nenhuma falha ativa para limpar.")
+                    self.log.warning("[CONSOLE] Nenhuma falha ativa para limpar.")
                     continue
                 asyncio.create_task(self._send_fault_clear())
 
@@ -1614,7 +1617,7 @@ class EVChargerSim(BaseChargePoint):
             # precisar de um evento OCPP padrão que dispare isso sozinho.
             elif cmd == "datatransfer":
                 if len(parts) < 2:
-                    self.logger.warning(
+                    self.log.warning(
                         "[CONSOLE] Uso: datatransfer <vendor_id> [message_id] [data...]"
                     )
                     continue
@@ -1626,7 +1629,7 @@ class EVChargerSim(BaseChargePoint):
                 )
 
             elif cmd == "help":
-                self.logger.info(
+                self.log.info(
                     "[CONSOLE] Comandos:\n"
                     "  start <id_tag>   — RFID local (Authorize/lista local → StartTransaction)\n"
                     "  stop             — cliente encerra sessão (ev_disconnected)\n"
@@ -1644,7 +1647,7 @@ class EVChargerSim(BaseChargePoint):
                     "  controladas pelo CSMS — 'start' respeita ambas automaticamente."
                 )
             elif cmd:
-                self.logger.warning(f"[CONSOLE] Comando desconhecido: '{cmd}'. Digite 'help'.")
+                self.log.warning(f"[CONSOLE] Comando desconhecido: '{cmd}'. Digite 'help'.")
 
     async def _local_start_flow(self, connector_id: int, id_tag: str):
         """
@@ -1663,7 +1666,7 @@ class EVChargerSim(BaseChargePoint):
             local_status = self.state.local_auth_list.get(id_tag)
             if local_status is not None:
                 status = local_status
-                self.logger.info(
+                self.log.info(
                     f"[LOCAL START] id_tag='{id_tag}' encontrado na lista local "
                     f"(status={status}) — sem chamada Authorize ao CSMS."
                 )
@@ -1673,18 +1676,18 @@ class EVChargerSim(BaseChargePoint):
                 status = auth_response.id_tag_info.get("status", "Invalid")
 
             if status != AuthorizationStatus.accepted:
-                self.logger.warning(
+                self.log.warning(
                     f"[LOCAL START] id_tag='{id_tag}' não autorizado "
                     f"(status={status}). Sessão não iniciada."
                 )
                 return
 
-            self.logger.info(
+            self.log.info(
                 f"[LOCAL START] id_tag='{id_tag}' autorizado → iniciando transação"
             )
             await self._send_start_transaction(connector_id, id_tag)
         except Exception:
-            self.logger.exception("[LOCAL START] Falha no fluxo de autorização local.")
+            self.log.exception("[LOCAL START] Falha no fluxo de autorização local.")
 
     async def _send_fault_notification(self, error_code: ChargePointErrorCode):
         """
@@ -1695,7 +1698,7 @@ class EVChargerSim(BaseChargePoint):
         """
         state = self.state
         if state.active_transaction_id is not None:
-            self.logger.warning(
+            self.log.warning(
                 f"[FAULT] Sessão ativa (tx={state.active_transaction_id}) será "
                 "encerrada pelo fault antes de reportar o erro."
             )
@@ -1715,7 +1718,7 @@ class EVChargerSim(BaseChargePoint):
             status=ChargePointStatus.faulted,
         )
         await self.call(request)
-        self.logger.warning(
+        self.log.warning(
             f"⚠️  [FAULT] StatusNotification enviado: Faulted / {error_code.value} "
             "— use 'clear' para voltar a Available."
         )
@@ -1729,19 +1732,19 @@ class EVChargerSim(BaseChargePoint):
         """
         self.state.is_faulted = False
         await self.send_status_notification(ChargePointStatus.available)
-        self.logger.info("✅ [FAULT] Falha limpa — charger voltou para Available")
+        self.log.info("✅ [FAULT] Falha limpa — charger voltou para Available")
 
     async def _send_data_transfer(self, vendor_id: str, message_id: str | None, data: str | None):
         """Envia um DataTransfer arbitrário do charger para o CSMS (comando 'datatransfer' do console)."""
         try:
             request = call.DataTransfer(vendor_id=vendor_id, message_id=message_id, data=data)
             response = await self.call(request)
-            self.logger.info(
+            self.log.info(
                 f"[DATA TRANSFER] enviado | vendor_id={vendor_id} → "
                 f"resposta: status={response.status} data={response.data!r}"
             )
         except Exception:
-            self.logger.exception("[DATA TRANSFER] Falha ao enviar.")
+            self.log.exception("[DATA TRANSFER] Falha ao enviar.")
 
     async def simulate_connection_flow(self):
         """
