@@ -37,7 +37,25 @@ instância, por exemplo:
 
 Se a conexão com o CSMS cair (ou ele ainda não estiver de pé), o
 simulador tenta reconectar automaticamente com backoff exponencial —
-não precisa reiniciar o script manualmente.
+não precisa reiniciar o script manualmente. Enquanto offline, a sessão
+continua rodando fisicamente (SoC sobe, energia acumula) e mensagens
+que não puderam ser enviadas (StatusNotification, MeterValues,
+Start/StopTransaction) ficam numa fila local, entregues ao CSMS em
+ordem assim que a conexão volta — ver comando "queue" no console.
+
+Para injetar instabilidade de rede de propósito (testar a robustez do
+seu CSMS sem depender de uma queda real):
+    python evchargersim.py --chaos-disconnect-interval 60
+                                              (derruba o WebSocket a cada
+                                                ~60s ± jitter)
+    python evchargersim.py --chaos-latency-min 200 --chaos-latency-max 2000
+                                              (atraso artificial de 200–2000ms
+                                                antes de cada mensagem)
+    python evchargersim.py --chaos-drop-rate 0.1
+                                              (10% das mensagens são
+                                                simuladas como perdidas)
+Essas flags podem ser combinadas, e o comando "disconnect" no console
+derruba a conexão manualmente a qualquer momento, sem precisar delas.
 
 Comandos disponíveis no terminal durante a execução:
     start <id_tag>   -> simula motorista passando RFID no totem (Authorize
@@ -75,6 +93,19 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import websockets
+# BUG REAL PRÉ-EXISTENTE, corrigido aqui: a lib `websockets` usa lazy
+# loading (PEP 562) no seu __init__.py e só expõe automaticamente um
+# conjunto fixo de nomes top-level (connect, serve, etc) — `exceptions`
+# NÃO está nessa lista. Sem este import explícito, qualquer
+# `websockets.exceptions.ConnectionClosed` no código (inclusive o já
+# existente antes desta sessão, no except de reconexão de main())
+# levanta AttributeError na hora de casar a exceção — ou seja, uma queda
+# de rede REAL provavelmente nunca era capturada corretamente pelo
+# except dedicado; o AttributeError substituía silenciosamente a
+# exceção original. Importar o submódulo explicitamente uma vez aqui
+# resolve para o arquivo inteiro (comportamento padrão de import do
+# Python: o submódulo fica de fato vinculado como atributo do pacote).
+import websockets.exceptions
 from ocpp.routing import on
 from ocpp.v16 import call, call_result
 from ocpp.v16 import ChargePoint as BaseChargePoint
@@ -153,6 +184,25 @@ class SimConfig:
     # _send_start_transaction / _send_stop_transaction.
     call_timeout_seconds: float = 30.0
 
+    # ── INSTABILIDADE DE REDE INJETÁVEL (chaos) ─────────────────────
+    # Tudo aqui é opt-in — 0/desligado por padrão, sem mudar em nada o
+    # comportamento de quem não passar essas flags.
+
+    # Desconecta o WebSocket de propósito a cada N segundos (± jitter),
+    # pra testar a lógica de reconexão/fila offline do CSMS sem precisar
+    # derrubar o servidor manualmente. 0 = desabilitado.
+    chaos_disconnect_interval_seconds: float = 0.0
+    chaos_disconnect_jitter_seconds: float = 5.0
+
+    # Atraso artificial (ms) antes de cada mensagem enviada, simulando
+    # rede lenta/alta latência. 0/0 = desabilitado.
+    chaos_latency_min_ms: float = 0.0
+    chaos_latency_max_ms: float = 0.0
+
+    # Probabilidade (0.0–1.0) de uma mensagem enviada ser simulada como
+    # "perdida na rede" — nunca chega a sair de verdade. 0.0 = desabilitado.
+    chaos_drop_rate: float = 0.0
+
     @classmethod
     def load(cls, argv=None) -> "SimConfig":
         """Monta a config final combinando defaults, --config e flags de CLI."""
@@ -192,6 +242,11 @@ class SimConfig:
             "initial_soc_percent": args.initial_soc,
             "nominal_voltage": args.voltage,
             "call_timeout_seconds": args.call_timeout,
+            "chaos_disconnect_interval_seconds": args.chaos_disconnect_interval,
+            "chaos_disconnect_jitter_seconds": args.chaos_disconnect_jitter,
+            "chaos_latency_min_ms": args.chaos_latency_min,
+            "chaos_latency_max_ms": args.chaos_latency_max,
+            "chaos_drop_rate": args.chaos_drop_rate,
         }
         for key, value in cli_overrides.items():
             if value is not None:
@@ -240,6 +295,26 @@ def _parse_args(argv=None):
     parser.add_argument("--call-timeout", type=float, default=None,
                          help="Timeout em segundos para chamadas críticas "
                               "(Start/StopTransaction) ao CSMS (padrão: 30.0).")
+    parser.add_argument(
+        "--chaos-disconnect-interval", type=float, default=None,
+        help="Derruba o WebSocket de propósito a cada N segundos (± jitter), "
+             "para testar reconexão/fila offline do CSMS. 0/omitido = desabilitado.")
+    parser.add_argument(
+        "--chaos-disconnect-jitter", type=float, default=None,
+        help="Variação aleatória (± segundos) em torno de --chaos-disconnect-interval "
+             "(padrão: 5.0).")
+    parser.add_argument(
+        "--chaos-latency-min", type=float, default=None,
+        help="Atraso mínimo artificial (ms) antes de cada mensagem enviada "
+             "(padrão: 0).")
+    parser.add_argument(
+        "--chaos-latency-max", type=float, default=None,
+        help="Atraso máximo artificial (ms) antes de cada mensagem enviada — "
+             "o atraso real de cada envio é sorteado entre min e max (padrão: 0).")
+    parser.add_argument(
+        "--chaos-drop-rate", type=float, default=None,
+        help="Probabilidade (0.0–1.0) de uma mensagem enviada ser simulada "
+             "como perdida na rede (padrão: 0.0).")
     parser.add_argument(
         "--verbose", action="store_true",
         help="Mostra Heartbeat e GetConfiguration no terminal (por padrão "
@@ -326,6 +401,17 @@ class ChargerState:
     # mudança só é aplicada de fato quando a sessão termina (não dá pra
     # tirar o conector de operação com o carro ainda carregando).
     pending_availability_change: str | None = None
+
+    # ── FILA DE TRANSAÇÕES OFFLINE ──────────────────────────────────
+    # Mensagens que não puderam ser enviadas porque o simulador estava
+    # sem conexão (ou uma mensagem foi simulada como perdida via chaos)
+    # esperam aqui até a próxima reconexão, quando são reenviadas em
+    # ordem — ver EVChargerSim._call_or_queue / _flush_offline_queue.
+    # Cada item: {"kind": str, "request": <objeto call.X>, "local_tx_id": int|None}.
+    # local_tx_id só é usado por StartTransaction/StopTransaction que
+    # aconteceram com a sessão ainda não confirmada pelo CSMS (ver
+    # EVChargerSim._local_tx_counter).
+    offline_queue: list = field(default_factory=list)
 
 
 def read_grid_voltage(nominal_voltage: float) -> float:
@@ -507,6 +593,20 @@ class EVChargerSim(BaseChargePoint):
         # SetChargingProfile/ClearChargingProfile/fim de sessão.
         self._profile_task: asyncio.Task | None = None
 
+        # ── Plumbing de conectividade (fila offline / reconexão) ────
+        # Também instância, não ChargerState: são detalhes de transporte,
+        # não "dados simulados" do carregador. main() alterna esta flag
+        # (e reatribui self._connection, herdado de BaseChargePoint) a
+        # cada queda/reconexão — a instância inteira de EVChargerSim
+        # persiste através de reconexões, só a conexão WebSocket por
+        # baixo é trocada.
+        self.is_online: bool = False
+        # ID negativo temporário atribuído a uma sessão que começou (via
+        # StartTransaction) enquanto offline, até o CSMS confirmar um ID
+        # real no flush da fila — ver _send_start_transaction.
+        self._pending_local_tx_id: int | None = None
+        self._local_tx_counter: int = 0
+
     # --------------------------------------------------------
     # Handlers de mensagens recebidas do CSMS
     # --------------------------------------------------------
@@ -538,6 +638,167 @@ class EVChargerSim(BaseChargePoint):
         if self._profile_task is not None and not self._profile_task.done():
             self._profile_task.cancel()
         self._profile_task = None
+
+    def _enqueue_offline(self, kind: str, request, local_tx_id: int | None = None):
+        """Acrescenta uma mensagem à fila offline, pra reenvio na próxima reconexão."""
+        self.state.offline_queue.append(
+            {"kind": kind, "request": request, "local_tx_id": local_tx_id}
+        )
+        self.log.info(
+            f"[FILA OFFLINE] '{kind}' enfileirado "
+            f"(fila agora com {len(self.state.offline_queue)} mensagem(ns))."
+        )
+
+    async def _call_or_queue(
+        self,
+        request,
+        kind: str,
+        queueable: bool = True,
+        timeout: float | None = None,
+        queue_on_timeout: bool = False,
+        local_tx_id: int | None = None,
+    ):
+        """
+        Ponto único por onde toda mensagem "espontânea" do charger
+        (StatusNotification, MeterValues, Heartbeat, Start/StopTransaction)
+        passa antes de sair pela rede de verdade. Reúne duas
+        responsabilidades relacionadas:
+
+        1) FILA OFFLINE: se o simulador está offline (ou perde a conexão
+           bem no meio da tentativa), mensagens `queueable=True` são
+           guardadas em vez de simplesmente falhar — ver
+           _flush_offline_queue para o reenvio. Mensagens não essenciais
+           (ex: Heartbeat) usam queueable=False: são só puladas enquanto
+           offline, sem acumular na fila.
+
+        2) INSTABILIDADE DE REDE INJETÁVEL: latência artificial e perda
+           simulada de mensagens (SimConfig.chaos_*) são aplicadas aqui,
+           antes de qualquer tentativa real de envio — assim toda rotina
+           que manda mensagem ganha esse comportamento de graça, sem
+           precisar implementar chaos em cada uma individualmente.
+
+        queue_on_timeout controla se um simples "CSMS não respondeu a
+        tempo" (socket ainda pode estar são) deve ser tratado como
+        motivo para enfileirar — usado em Start/StopTransaction (não dá
+        pra simplesmente desistir de registrar uma transação), mas não
+        em mensagens periódicas como StatusNotification/MeterValues
+        (reenviar uma leitura de medidor velha depois não tem tanto valor).
+
+        Retorna a resposta do CSMS, ou None se a mensagem foi enfileirada,
+        descartada (chaos) ou não teve resposta a tempo.
+        """
+        timeout = timeout if timeout is not None else self.config.call_timeout_seconds
+
+        # Chaos: atraso artificial antes de sequer tentar enviar.
+        if self.config.chaos_latency_max_ms > 0:
+            delay_ms = random.uniform(
+                self.config.chaos_latency_min_ms, self.config.chaos_latency_max_ms
+            )
+            if delay_ms > 0:
+                await asyncio.sleep(delay_ms / 1000)
+
+        # Chaos: perda de mensagem simulada — nunca tentamos enviar de verdade.
+        if self.config.chaos_drop_rate > 0 and random.random() < self.config.chaos_drop_rate:
+            self.log.warning(f"[CHAOS] '{kind}' descartado (perda de rede simulada).")
+            if queueable:
+                self._enqueue_offline(kind, request, local_tx_id=local_tx_id)
+            return None
+
+        if not self.is_online:
+            if queueable:
+                self._enqueue_offline(kind, request, local_tx_id=local_tx_id)
+            else:
+                self.log.debug(f"[OFFLINE] '{kind}' pulado (não crítico, não enfileirável).")
+            return None
+
+        try:
+            return await asyncio.wait_for(self.call(request), timeout=timeout)
+        except asyncio.TimeoutError:
+            self.log.warning(f"[CSMS] '{kind}' não teve resposta em {timeout}s.")
+            if queueable and queue_on_timeout:
+                self._enqueue_offline(kind, request, local_tx_id=local_tx_id)
+            return None
+        except (websockets.exceptions.ConnectionClosed, OSError) as exc:
+            self.log.warning(f"[OFFLINE] conexão perdida enviando '{kind}' ({exc!r}).")
+            self.is_online = False
+            if queueable:
+                self._enqueue_offline(kind, request, local_tx_id=local_tx_id)
+            return None
+
+    async def _flush_offline_queue(self):
+        """
+        Reenvia, em ordem, as mensagens acumuladas enquanto o simulador
+        estava offline — é isso que dá sentido a uma sessão que começou
+        (ou terminou) sem conexão: StartTransaction/StopTransaction/
+        StatusNotification/MeterValues enfileirados são entregues ao
+        CSMS assim que a conexão volta, na mesma ordem em que aconteceram
+        de verdade.
+
+        Se um StartTransaction enfileirado usava um ID local temporário
+        (negativo, atribuído por _send_start_transaction enquanto
+        offline), o ID real devolvido pelo CSMS é propagado para
+        qualquer StopTransaction enfileirado depois que referenciava
+        esse mesmo ID local — sem essa correção, o CSMS receberia um
+        StopTransaction para um transaction_id que nunca existiu do lado
+        dele.
+
+        Limitação conhecida: como não geramos IDs de mensagem próprios
+        para deduplicação, se a conexão cair DEPOIS do CSMS já ter
+        processado uma mensagem mas ANTES da confirmação chegar até nós,
+        um reenvio no próximo flush pode registrar a mesma
+        StartTransaction/MeterValues duas vezes do lado do servidor. O
+        protocolo OCPP 1.6 não tem um mecanismo de idempotência embutido
+        pra isso — é uma limitação real do protocolo, não só deste
+        simulador.
+        """
+        state = self.state
+        if not state.offline_queue:
+            return
+
+        queue = state.offline_queue
+        state.offline_queue = []  # o que não for entregue volta pro final, abaixo
+        self.log.info(
+            f"[FILA OFFLINE] reconectado — reenviando {len(queue)} mensagem(ns) pendente(s)..."
+        )
+        local_to_real: dict[int, int] = {}
+
+        for i, item in enumerate(queue):
+            kind, request, local_tx_id = item["kind"], item["request"], item["local_tx_id"]
+
+            # Corrige a referência de ID local -> real antes de enviar,
+            # se já resolvida por um StartTransaction anterior nesta
+            # mesma rodada de flush.
+            if kind == "StopTransaction" and local_tx_id in local_to_real:
+                request.transaction_id = local_to_real[local_tx_id]
+
+            try:
+                response = await asyncio.wait_for(
+                    self.call(request), timeout=self.config.call_timeout_seconds
+                )
+            except (websockets.exceptions.ConnectionClosed, OSError, asyncio.TimeoutError) as exc:
+                self.log.warning(
+                    f"[FILA OFFLINE] conexão caiu de novo durante o flush ({exc!r}) — "
+                    f"{len(queue) - i} mensagem(ns) voltam para a fila."
+                )
+                self.is_online = False
+                state.offline_queue = queue[i:]  # este item + os que nem tentamos
+                return
+
+            self.log.info(f"[FILA OFFLINE] '{kind}' entregue com sucesso.")
+
+            if kind == "StartTransaction" and local_tx_id is not None and response is not None:
+                real_id = response.transaction_id
+                local_to_real[local_tx_id] = real_id
+                if state.active_transaction_id == local_tx_id:
+                    state.active_transaction_id = real_id
+                if self._pending_local_tx_id == local_tx_id:
+                    self._pending_local_tx_id = None
+                self.log.info(
+                    f"[FILA OFFLINE] ID local {local_tx_id} resolvido para "
+                    f"transaction_id real {real_id}"
+                )
+
+        self.log.info("[FILA OFFLINE] todas as mensagens pendentes foram entregues.")
 
     def _apply_offered_amps(self, offered_amps: float, source: str):
         """
@@ -1111,20 +1372,29 @@ class EVChargerSim(BaseChargePoint):
     # --------------------------------------------------------
 
     async def send_boot_notification(self):
-        self.state.battery_soc_percent = self.config.initial_soc_percent
-        # Um (re)boot é um bom ponto pra limpar uma falha simulada — cada
-        # nova conexão começa "limpa" em vez de herdar Faulted de uma
-        # sessão de simulador anterior (ex: depois de uma reconexão
-        # automática).
-        self.state.is_faulted = False
-        self.log.info(f"[BATERIA] SoC inicial: {self.state.battery_soc_percent:.1f}%")
+        """
+        IMPORTANTE: não reseta mais SoC/is_faulted aqui. Antes fazia
+        sentido porque uma nova conexão sempre significava uma instância
+        nova de EVChargerSim — mas agora a MESMA instância persiste
+        através de reconexões (ver main()), especificamente para que uma
+        sessão em andamento (ou uma falha real) sobreviva a uma queda de
+        rede em vez de ser silenciosamente apagada. Resetar esses campos
+        aqui destruiria justamente o estado que a fila offline existe
+        para preservar.
 
+        Não é enfileirável (queueable=False): não faz sentido acumular
+        BootNotifications na fila — se ficarmos offline, isso já é
+        tratado pelo laço de reconexão em main(), que manda um novo
+        BootNotification assim que a conexão volta.
+        """
         request = call.BootNotification(
             charge_point_model="EVChargerSim",
             charge_point_vendor="EVChargerSim",
             firmware_version="SIM-1.0",
         )
-        response = await self.call(request)
+        response = await self._call_or_queue(request, kind="BootNotification", queueable=False)
+        if response is None:
+            return
         if response.status == RegistrationStatus.accepted:
             self.log.info("BootNotification aceito pelo CSMS.")
         else:
@@ -1136,14 +1406,18 @@ class EVChargerSim(BaseChargePoint):
             error_code=ChargePointErrorCode.no_error,
             status=status,
         )
-        await self.call(request)
-        self.log.info(f"StatusNotification enviado: {status}")
+        response = await self._call_or_queue(request, kind=f"StatusNotification({status})")
+        if response is not None:
+            self.log.info(f"StatusNotification enviado: {status}")
 
     async def _send_start_transaction(self, connector_id: int, id_tag: str):
         """
         Envia StartTransaction simulando o carregador autorizando e fechando
-        o contator. Sem isso, o CSMS nunca recebe um transaction_id e a
-        sessão nunca é registrada (nem no dashboard, nem no banco).
+        o contator. Se estiver offline (ou a mensagem for perdida por
+        chaos), a sessão roda localmente do mesmo jeito — um EV já
+        autorizado (ex: via lista local) continua carregando fisicamente
+        mesmo sem conexão — com um ID de transação temporário (negativo)
+        até o CSMS confirmar um ID real no próximo flush da fila offline.
         """
         state = self.state
         try:
@@ -1177,9 +1451,17 @@ class EVChargerSim(BaseChargePoint):
             )
 
             # Simula o veículo sendo conectado e o carregador preparando
-            # a sessão (LED branco piscando, conector travado etc).
+            # a sessão (LED branco piscando, conector travado etc). Se
+            # estivermos offline, send_status_notification já enfileira
+            # isso sozinho — não precisamos de tratamento especial aqui.
             await self.send_status_notification(ChargePointStatus.preparing)
             await asyncio.sleep(1)  # simula o pequeno delay real de fechamento do contator
+
+            # Reserva um ID local para esta sessão ANTES de tentar enviar —
+            # se a mensagem for enfileirada por qualquer motivo (offline,
+            # timeout, chaos), já temos um ID consistente pra usar.
+            self._local_tx_counter -= 1
+            local_id = self._local_tx_counter
 
             request = call.StartTransaction(
                 connector_id=connector_id,
@@ -1187,19 +1469,38 @@ class EVChargerSim(BaseChargePoint):
                 meter_start=int(state.energy_meter_wh),
                 timestamp=datetime.now(timezone.utc).isoformat(),
             )
-            # Timeout explícito: sem isso, um CSMS que trava sem
-            # responder deixa este await pendurado pra sempre — nenhuma
-            # exceção, nenhum log, a sessão simplesmente nunca avança
-            # (nem falha nem é registrada), e ninguém percebe até
-            # reparar que o simulador ficou mudo.
-            response = await asyncio.wait_for(
-                self.call(request), timeout=self.config.call_timeout_seconds
+            # queue_on_timeout=True: mesmo um simples "CSMS não respondeu"
+            # (sem a conexão necessariamente ter caído) ainda assim
+            # enfileira — não dá pra simplesmente desistir de registrar
+            # uma transação que fisicamente já está em andamento.
+            response = await self._call_or_queue(
+                request,
+                kind="StartTransaction",
+                queueable=True,
+                queue_on_timeout=True,
+                local_tx_id=local_id,
             )
-            state.active_transaction_id = response.transaction_id
-            self.log.info(
-                f"⚡ [START TRANSACTION] aceito pelo CSMS | "
-                f"transaction_id={state.active_transaction_id} | id_tag={id_tag}"
-            )
+
+            if response is not None:
+                # Confirmado na hora — fluxo normal, online.
+                state.active_transaction_id = response.transaction_id
+                self.log.info(
+                    f"⚡ [START TRANSACTION] aceito pelo CSMS | "
+                    f"transaction_id={state.active_transaction_id} | id_tag={id_tag}"
+                )
+            else:
+                # _call_or_queue com queueable=True + queue_on_timeout=True
+                # cobre TODO caminho de falha (offline, timeout, chaos) —
+                # response is None aqui sempre significa que foi
+                # enfileirado. A sessão já está "fisicamente" rodando do
+                # lado do carro; só a confirmação do CSMS que fica pendente.
+                state.active_transaction_id = local_id
+                self._pending_local_tx_id = local_id
+                self.log.warning(
+                    f"[FILA OFFLINE] StartTransaction enfileirado — sessão "
+                    f"rodando localmente com ID temporário {local_id} até "
+                    "reconectar e confirmar com o CSMS."
+                )
 
             # Uma sessão que começa consome a reserva do conector, se
             # houver uma — um charger físico real libera a reserva assim
@@ -1219,19 +1520,16 @@ class EVChargerSim(BaseChargePoint):
             # configurado de verdade.
 
             await self.send_status_notification(ChargePointStatus.charging)
-        except asyncio.TimeoutError:
-            self.log.error(
-                f"[START TRANSACTION] CSMS não respondeu em "
-                f"{self.config.call_timeout_seconds}s — sessão NÃO foi "
-                "registrada. Verifique se o CSMS está processando mensagens."
-            )
         except Exception:
-            # Sem isso, uma falha aqui (ex: conexão caiu nesse meio tempo)
-            # morre silenciosamente — a task roda em segundo plano via
-            # create_task e ninguém nunca dá "await" nela para propagar o erro.
+            # Cobre qualquer coisa inesperada fora do fluxo normal de
+            # offline/timeout já tratado acima (esse já não propaga mais
+            # exceção — só entra aqui algo genuinamente imprevisto). Sem
+            # isso, uma falha aqui morre silenciosamente — a task roda em
+            # segundo plano via create_task e ninguém nunca dá "await"
+            # nela para propagar o erro.
             self.log.exception(
-                "[START TRANSACTION] FALHOU ao enviar — sessão NÃO foi "
-                "registrada no CSMS. Verifique se a conexão ainda está ativa."
+                "[START TRANSACTION] erro inesperado — sessão pode não ter "
+                "sido registrada corretamente."
             )
 
     async def _send_stop_transaction(
@@ -1257,6 +1555,20 @@ class EVChargerSim(BaseChargePoint):
         # sentido continuar aplicando degraus de corrente de um perfil
         # cujo alvo (a transação) acabou de encerrar.
         self._cancel_profile_task()
+
+        # A sessão para FISICAMENTE agora, mesmo que o CSMS ainda não
+        # saiba (ex: offline) — replica um charger real, que abre o
+        # contator na hora e só avisa o servidor depois, quando puder.
+        # Isso também é o que torna a fila offline coerente: se
+        # continuássemos "carregando" até a confirmação chegar, um
+        # StopTransaction enfileirado não faria sentido nenhum.
+        local_id_being_stopped = transaction_id if transaction_id is not None and transaction_id < 0 else None
+        state.active_transaction_id = None
+        state.current_offered_amps = 0.0
+        state.current_actual_amps = 0.0
+        state.session_suspended = False
+        state.evse_suspended_by_profile = False
+
         try:
             await asyncio.sleep(0.5)
 
@@ -1266,21 +1578,30 @@ class EVChargerSim(BaseChargePoint):
                 transaction_id=transaction_id,
                 reason=reason,
             )
-            # Mesmo timeout explícito do _send_start_transaction — ver
-            # comentário lá para o porquê.
-            await asyncio.wait_for(
-                self.call(request), timeout=self.config.call_timeout_seconds
+            # queue_on_timeout=True pelo mesmo motivo do
+            # _send_start_transaction: a sessão já parou de verdade, não
+            # dá pra simplesmente desistir de avisar o CSMS. Se
+            # `transaction_id` ainda é um ID local (StartTransaction
+            # correspondente também ainda não confirmado), local_tx_id
+            # aqui permite ao flush da fila corrigir a referência depois.
+            response = await self._call_or_queue(
+                request,
+                kind="StopTransaction",
+                queueable=True,
+                queue_on_timeout=True,
+                local_tx_id=local_id_being_stopped,
             )
-            self.log.info(
-                f"🛑 [STOP TRANSACTION] enviado | transaction_id={transaction_id}"
-                + (f" | motivo={reason.value}" if reason else "")
-            )
-
-            state.active_transaction_id = None
-            state.current_offered_amps = 0.0
-            state.current_actual_amps = 0.0
-            state.session_suspended = False
-            state.evse_suspended_by_profile = False
+            if response is not None:
+                self.log.info(
+                    f"🛑 [STOP TRANSACTION] enviado | transaction_id={transaction_id}"
+                    + (f" | motivo={reason.value}" if reason else "")
+                )
+            else:
+                self.log.warning(
+                    f"[FILA OFFLINE] StopTransaction enfileirado "
+                    f"(transaction_id={transaction_id}) — será entregue ao "
+                    "CSMS na próxima reconexão."
+                )
 
             if skip_status_flow:
                 # Usado por reset/fault/firmware, que têm sua própria
@@ -1321,21 +1642,15 @@ class EVChargerSim(BaseChargePoint):
             await self.send_status_notification(ChargePointStatus.finishing)
             await asyncio.sleep(2)
             await self.send_status_notification(ChargePointStatus.available)
-        except asyncio.TimeoutError:
-            self.log.error(
-                f"[STOP TRANSACTION] CSMS não respondeu em "
-                f"{self.config.call_timeout_seconds}s — a sessão "
-                f"(transaction_id={transaction_id}) vai continuar 'pendurada' "
-                "como ativa no banco de dados até ser encerrada manualmente."
-            )
         except Exception:
-            # Mesmo cuidado do _send_start_transaction: sem isso, a sessão
-            # fica "pendurada" no banco (started_at preenchido, stopped_at
-            # nulo para sempre) sem nenhum aviso de que algo falhou.
+            # Cobre algo genuinamente inesperado fora do fluxo de
+            # offline/timeout já tratado acima. O estado local já foi
+            # limpo no início da função — o que pode ficar pendente aqui
+            # é só a sequência de status pós-stop (Finishing/Available),
+            # não a integridade da sessão em si.
             self.log.exception(
-                "[STOP TRANSACTION] FALHOU ao enviar — a sessão "
-                f"(transaction_id={transaction_id}) vai continuar 'pendurada' "
-                "como ativa no banco de dados até ser encerrada manualmente."
+                "[STOP TRANSACTION] erro inesperado após a sessão já ter "
+                "sido encerrada localmente."
             )
 
     async def energy_accumulator_loop(self, interval_seconds: int = 30):
@@ -1353,41 +1668,53 @@ class EVChargerSim(BaseChargePoint):
         Antes esse fator existia como constante (SIMULATION_SPEED) mas
         nunca era de fato aplicado em lugar nenhum — sessões "aceleradas"
         não tinham efeito algum na prática.
+
+        Este loop agora é iniciado UMA VEZ (em main()) e roda para
+        sempre, independente de quedas/reconexões — continuar
+        "carregando" fisicamente mesmo offline é justamente o que torna
+        a fila offline coerente. Por isso cada ciclo tem seu próprio
+        try/except: um erro isolado não pode derrubar a simulação de
+        carregamento para sempre.
         """
         state = self.state
         while True:
             await asyncio.sleep(interval_seconds)
+            try:
+                if state.active_transaction_id is None:
+                    continue
+                if state.session_suspended or state.current_actual_amps <= 0:
+                    continue
 
-            if state.active_transaction_id is None:
-                continue
-            if state.session_suspended or state.current_actual_amps <= 0:
-                continue
-
-            power_w = self.config.nominal_voltage * state.current_actual_amps
-            energy_delta_wh = (
-                power_w * (interval_seconds / 3600) * self.config.simulation_speed
-            )
-            state.energy_meter_wh += energy_delta_wh
-
-            state.battery_soc_percent = min(
-                100.0,
-                state.battery_soc_percent
-                + (energy_delta_wh / self.config.battery_capacity_wh) * 100,
-            )
-            state.current_actual_amps = compute_actual_current(
-                state.current_offered_amps, state.battery_soc_percent
-            )
-
-            if state.battery_soc_percent >= 100.0:
-                state.current_actual_amps = 0.0
-                self.log.info(
-                    "[BATERIA] SoC atingiu 100% — EV sinalizou bateria cheia. "
-                    "Encerrando sessão automaticamente (Reason.ev_disconnected)."
+                power_w = self.config.nominal_voltage * state.current_actual_amps
+                energy_delta_wh = (
+                    power_w * (interval_seconds / 3600) * self.config.simulation_speed
                 )
-                asyncio.create_task(
-                    self._send_stop_transaction(
-                        state.active_transaction_id, reason=Reason.ev_disconnected
+                state.energy_meter_wh += energy_delta_wh
+
+                state.battery_soc_percent = min(
+                    100.0,
+                    state.battery_soc_percent
+                    + (energy_delta_wh / self.config.battery_capacity_wh) * 100,
+                )
+                state.current_actual_amps = compute_actual_current(
+                    state.current_offered_amps, state.battery_soc_percent
+                )
+
+                if state.battery_soc_percent >= 100.0:
+                    state.current_actual_amps = 0.0
+                    self.log.info(
+                        "[BATERIA] SoC atingiu 100% — EV sinalizou bateria cheia. "
+                        "Encerrando sessão automaticamente (Reason.ev_disconnected)."
                     )
+                    asyncio.create_task(
+                        self._send_stop_transaction(
+                            state.active_transaction_id, reason=Reason.ev_disconnected
+                        )
+                    )
+            except Exception:
+                self.log.exception(
+                    "[BATERIA] erro inesperado no acumulador de energia — "
+                    "continuando no próximo ciclo."
                 )
 
     async def send_heartbeat_loop(self):
@@ -1396,88 +1723,112 @@ class EVChargerSim(BaseChargePoint):
         cada ciclo — assim, uma mudança de HeartbeatInterval feita via
         CSMS (on_change_configuration) tem efeito já no próximo
         heartbeat, sem precisar reiniciar o simulador.
+
+        Roda para sempre (iniciado uma vez em main()) — Heartbeat não é
+        enfileirável (queueable=False): enquanto offline, cada ciclo só
+        é pulado silenciosamente (em DEBUG), sem acumular na fila —
+        reenviar heartbeats "atrasados" depois de reconectar não tem
+        valor nenhum, o próximo heartbeat ao vivo já resolve.
         """
         while True:
-            await self.call(call.Heartbeat())
-            # DEBUG, não INFO: essa linha nunca traz informação nova (é
-            # literalmente "ainda estou vivo" a cada ciclo) — só aparece
-            # no terminal com --verbose.
-            self.log.debug(
-                f"Heartbeat enviado (intervalo atual: {self.state.current_heartbeat_interval}s)."
-            )
+            try:
+                response = await self._call_or_queue(
+                    call.Heartbeat(), kind="Heartbeat", queueable=False
+                )
+                if response is not None:
+                    # DEBUG, não INFO: essa linha nunca traz informação
+                    # nova (é literalmente "ainda estou vivo" a cada
+                    # ciclo) — só aparece no terminal com --verbose.
+                    self.log.debug(
+                        f"Heartbeat enviado (intervalo atual: "
+                        f"{self.state.current_heartbeat_interval}s)."
+                    )
+            except Exception:
+                self.log.exception("[HEARTBEAT] erro inesperado — continuando no próximo ciclo.")
             await asyncio.sleep(self.state.current_heartbeat_interval)
 
     async def send_meter_values_loop(self, interval_seconds: int = 30):
         """
         Manda MeterValues periodicamente reportando a corrente "real" simulada.
         Isso é o que vai aparecer no seu dashboard como se fosse o charger reportando.
+
+        Roda para sempre (iniciado uma vez em main()) — enquanto offline,
+        cada MeterValues é enfileirado (queueable=True, o padrão) e
+        entregue ao CSMS em ordem na próxima reconexão, preservando o
+        histórico de carregamento mesmo durante a queda.
         """
         state = self.state
         while True:
-            timestamp = datetime.now(timezone.utc).isoformat()
-            voltage_now = read_grid_voltage(self.config.nominal_voltage)
-            request = call.MeterValues(
-                connector_id=self.config.connector_id,
-                meter_value=[
-                    {
-                        "timestamp": timestamp,
-                        "sampledValue": [
-                            {
-                                "value": str(state.current_actual_amps),
-                                "context": "Sample.Periodic",
-                                "measurand": "Current.Import",
-                                "unit": "A",
-                            },
-                            {
-                                "value": str(state.current_offered_amps),
-                                "context": "Sample.Periodic",
-                                "measurand": "Current.Offered",
-                                "unit": "A",
-                            },
-                            {
-                                "value": str(voltage_now),
-                                "context": "Sample.Periodic",
-                                "measurand": "Voltage",
-                                "unit": "V",
-                            },
-                            {
-                                "value": str(round(voltage_now * state.current_actual_amps, 1)),
-                                "context": "Sample.Periodic",
-                                "measurand": "Power.Active.Import",
-                                "unit": "W",
-                            },
-                            {
-                                "value": str(int(state.energy_meter_wh)),
-                                "context": "Sample.Periodic",
-                                "measurand": "Energy.Active.Import.Register",
-                                "unit": "Wh",
-                            },
-                        ],
-                    }
-                ],
-            )
-            await self.call(request)
-
-            power_kw = round((voltage_now * state.current_actual_amps) / 1000, 2)
-            energy_kwh = round(state.energy_meter_wh / 1000, 2)
-
-            has_session = state.active_transaction_id is not None
-            suspended = state.session_suspended or state.evse_suspended_by_profile
-            color = _meter_line_color(has_session, suspended, state.is_faulted, self.use_color)
-            reset = "\033[0m" if self.use_color else ""
-
-            # INFO (visível por padrão) — diferente do Heartbeat, esta é a
-            # única linha que mostra o que está de fato acontecendo com a
-            # sessão (SoC, corrente, potência), então vale ficar visível
-            # sem precisar de --verbose.
-            if has_session:
-                self.log.info(
-                    f"{color}🔋 SoC {state.battery_soc_percent:5.1f}%  "
-                    f"⚡ {state.current_actual_amps:4.1f}/{state.current_offered_amps:4.1f}A  "
-                    f"{power_kw:5.2f}kW  Σ{energy_kwh:6.2f}kWh{reset}"
+            try:
+                timestamp = datetime.now(timezone.utc).isoformat()
+                voltage_now = read_grid_voltage(self.config.nominal_voltage)
+                request = call.MeterValues(
+                    connector_id=self.config.connector_id,
+                    meter_value=[
+                        {
+                            "timestamp": timestamp,
+                            "sampledValue": [
+                                {
+                                    "value": str(state.current_actual_amps),
+                                    "context": "Sample.Periodic",
+                                    "measurand": "Current.Import",
+                                    "unit": "A",
+                                },
+                                {
+                                    "value": str(state.current_offered_amps),
+                                    "context": "Sample.Periodic",
+                                    "measurand": "Current.Offered",
+                                    "unit": "A",
+                                },
+                                {
+                                    "value": str(voltage_now),
+                                    "context": "Sample.Periodic",
+                                    "measurand": "Voltage",
+                                    "unit": "V",
+                                },
+                                {
+                                    "value": str(round(voltage_now * state.current_actual_amps, 1)),
+                                    "context": "Sample.Periodic",
+                                    "measurand": "Power.Active.Import",
+                                    "unit": "W",
+                                },
+                                {
+                                    "value": str(int(state.energy_meter_wh)),
+                                    "context": "Sample.Periodic",
+                                    "measurand": "Energy.Active.Import.Register",
+                                    "unit": "Wh",
+                                },
+                            ],
+                        }
+                    ],
                 )
-            else:
-                self.log.info(f"{color}🔋 sem sessão ativa{reset}")
+                await self._call_or_queue(request, kind="MeterValues")
+
+                power_kw = round((voltage_now * state.current_actual_amps) / 1000, 2)
+                energy_kwh = round(state.energy_meter_wh / 1000, 2)
+
+                has_session = state.active_transaction_id is not None
+                suspended = state.session_suspended or state.evse_suspended_by_profile
+                color = _meter_line_color(has_session, suspended, state.is_faulted, self.use_color)
+                offline_marker = " 📡✗" if not self.is_online else ""
+                reset = "\033[0m" if self.use_color else ""
+
+                # INFO (visível por padrão) — diferente do Heartbeat, esta é a
+                # única linha que mostra o que está de fato acontecendo com a
+                # sessão (SoC, corrente, potência), então vale ficar visível
+                # sem precisar de --verbose.
+                if has_session:
+                    self.log.info(
+                        f"{color}🔋 SoC {state.battery_soc_percent:5.1f}%  "
+                        f"⚡ {state.current_actual_amps:4.1f}/{state.current_offered_amps:4.1f}A  "
+                        f"{power_kw:5.2f}kW  Σ{energy_kwh:6.2f}kWh{offline_marker}{reset}"
+                    )
+                else:
+                    self.log.info(f"{color}🔋 sem sessão ativa{offline_marker}{reset}")
+            except Exception:
+                self.log.exception(
+                    "[METER VALUES] erro inesperado — continuando no próximo ciclo."
+                )
 
             await asyncio.sleep(interval_seconds)
 
@@ -1492,7 +1843,8 @@ class EVChargerSim(BaseChargePoint):
         loop = asyncio.get_running_loop()
         self.log.info(
             "[CONSOLE] Pronto. Comandos: start <id_tag> | stop | pause | "
-            "resume | fault <código> | clear | datatransfer | help"
+            "resume | fault <código> | clear | datatransfer | queue | "
+            "disconnect | help"
         )
         # Prompt visível (">> ") em vez de input() sem marcador nenhum —
         # sem isso, era fácil perder de vista onde exatamente o terminal
@@ -1628,6 +1980,34 @@ class EVChargerSim(BaseChargePoint):
                     self._send_data_transfer(vendor_id, message_id, data)
                 )
 
+            # ── queue ───────────────────────────────────────────────────
+            # Mostra o que está acumulado na fila offline agora — útil
+            # pra confirmar que mensagens estão sendo enfileiradas
+            # corretamente durante um teste de queda de rede, sem
+            # precisar esperar a reconexão pra descobrir.
+            elif cmd == "queue":
+                n = len(state.offline_queue)
+                if n == 0:
+                    self.log.info("[CONSOLE] fila offline vazia.")
+                else:
+                    kinds = ", ".join(item["kind"] for item in state.offline_queue)
+                    self.log.info(f"[CONSOLE] fila offline com {n} mensagem(ns): {kinds}")
+                self.log.info(
+                    f"[CONSOLE] conectividade: {'online' if self.is_online else 'OFFLINE'}"
+                )
+
+            # ── disconnect ──────────────────────────────────────────────
+            # Derruba a conexão WebSocket na hora, de propósito — gatilho
+            # manual de chaos, complementar às flags --chaos-disconnect-*
+            # (que fazem isso sozinho em intervalos). Útil pra testar um
+            # cenário específico sem esperar o sorteio automático.
+            elif cmd == "disconnect":
+                if not self.is_online or self._connection is None:
+                    self.log.warning("[CONSOLE] já está offline.")
+                    continue
+                self.log.warning("[CONSOLE] forçando desconexão manual (teste de rede)...")
+                asyncio.create_task(self._connection.close())
+
             elif cmd == "help":
                 self.log.info(
                     "[CONSOLE] Comandos:\n"
@@ -1640,11 +2020,15 @@ class EVChargerSim(BaseChargePoint):
                     "  clear            — limpa a falha ativa (volta a Available)\n"
                     "  datatransfer <vendor_id> [message_id] [data]\n"
                     "                   — envia DataTransfer para o CSMS\n"
+                    "  queue            — mostra a fila offline e o status de conectividade\n"
+                    "  disconnect       — derruba a conexão de propósito (teste de rede)\n"
                     "  help             — esta mensagem\n"
                     "\n"
                     "  Reserva (ReserveNow/CancelReservation) e lista local "
                     "(SendLocalList) são\n"
-                    "  controladas pelo CSMS — 'start' respeita ambas automaticamente."
+                    "  controladas pelo CSMS — 'start' respeita ambas automaticamente.\n"
+                    "  Offline, mensagens (StatusNotification/MeterValues/Start·StopTransaction)\n"
+                    "  são enfileiradas e reenviadas automaticamente ao reconectar."
                 )
             elif cmd:
                 self.log.warning(f"[CONSOLE] Comando desconhecido: '{cmd}'. Digite 'help'.")
@@ -1660,7 +2044,11 @@ class EVChargerSim(BaseChargePoint):
         usamos o status de lá direto — sem round-trip nenhum ao CSMS,
         simulando um charger capaz de autorizar offline/localmente com
         uma lista pré-carregada. Só cai no Authorize remoto quando o
-        id_tag não está na lista local.
+        id_tag não está na lista local — e, se estivermos offline nesse
+        caso, recusamos direto: sem lista local e sem conexão, não tem
+        como confirmar autorização nenhuma (Authorize precisa de
+        resposta síncrona pra decidir se libera a sessão — não é algo
+        que faça sentido simplesmente enfileirar para depois).
         """
         try:
             local_status = self.state.local_auth_list.get(id_tag)
@@ -1670,9 +2058,24 @@ class EVChargerSim(BaseChargePoint):
                     f"[LOCAL START] id_tag='{id_tag}' encontrado na lista local "
                     f"(status={status}) — sem chamada Authorize ao CSMS."
                 )
+            elif not self.is_online:
+                self.log.warning(
+                    f"[LOCAL START] offline e id_tag='{id_tag}' não está na "
+                    "lista local — não é possível autorizar sem conexão. "
+                    "Sessão não iniciada."
+                )
+                return
             else:
                 auth_request = call.Authorize(id_tag=id_tag)
-                auth_response = await self.call(auth_request)
+                auth_response = await self._call_or_queue(
+                    auth_request, kind="Authorize", queueable=False
+                )
+                if auth_response is None:
+                    self.log.warning(
+                        f"[LOCAL START] Authorize para id_tag='{id_tag}' não "
+                        "teve resposta a tempo. Sessão não iniciada."
+                    )
+                    return
                 status = auth_response.id_tag_info.get("status", "Invalid")
 
             if status != AuthorizationStatus.accepted:
@@ -1746,16 +2149,43 @@ class EVChargerSim(BaseChargePoint):
         except Exception:
             self.log.exception("[DATA TRANSFER] Falha ao enviar.")
 
-    async def simulate_connection_flow(self):
+    async def run_first_boot_sequence(self):
         """
-        Simula o boot do carregador. Importante: fica em 'Available' (sem
-        veículo conectado) até receber um RemoteStartTransaction — é
-        _send_start_transaction que avança para Preparing -> Charging,
-        e _send_stop_transaction que volta para Available ao final.
+        Sequência da primeira conexão bem-sucedida da execução: fica em
+        'Available' (sem veículo conectado) até receber um
+        RemoteStartTransaction ou um "start" local — é
+        _send_start_transaction que avança para Preparing -> Charging, e
+        _send_stop_transaction que volta para Available ao final.
         """
         await self.send_boot_notification()
         await asyncio.sleep(1)
         await self.send_status_notification(ChargePointStatus.available)
+
+    async def run_reconnect_sequence(self):
+        """
+        Sequência executada toda vez que a MESMA instância (com todo o
+        estado que ela acumulou — sessão em andamento, SoC, fila
+        offline) reconecta depois de uma queda: reenvia BootNotification,
+        esvazia a fila de mensagens pendentes (ver _flush_offline_queue)
+        e informa ao CSMS o status atual do conector — que pode não ser
+        'Available' se, por exemplo, uma sessão continuou rodando durante
+        toda a queda.
+        """
+        self.log.info(
+            "[RECONEXÃO] reenviando BootNotification e esvaziando fila offline..."
+        )
+        await self.send_boot_notification()
+        await self._flush_offline_queue()
+
+        state = self.state
+        if state.active_transaction_id is not None:
+            await self.send_status_notification(ChargePointStatus.charging)
+        elif state.is_faulted:
+            await self.send_status_notification(ChargePointStatus.faulted)
+        elif state.availability_status == "Inoperative":
+            await self.send_status_notification(ChargePointStatus.unavailable)
+        else:
+            await self.send_status_notification(ChargePointStatus.available)
 
 
 def _print_banner(config: SimConfig):
@@ -1781,43 +2211,48 @@ def _print_banner(config: SimConfig):
         f" | Corrente padrão: {config.default_offered_amps:.0f}A",
         bar,
     ]
+    if config.chaos_disconnect_interval_seconds > 0 or config.chaos_drop_rate > 0 or config.chaos_latency_max_ms > 0:
+        lines.insert(len(lines) - 1,
+            f"  ⚠ CHAOS ativo     : desconexão a cada ~{config.chaos_disconnect_interval_seconds:.0f}s"
+            if config.chaos_disconnect_interval_seconds > 0 else "  ⚠ CHAOS ativo     :"
+        )
+        if config.chaos_latency_max_ms > 0:
+            lines.insert(len(lines) - 1,
+                f"                      latência {config.chaos_latency_min_ms:.0f}"
+                f"–{config.chaos_latency_max_ms:.0f}ms")
+        if config.chaos_drop_rate > 0:
+            lines.insert(len(lines) - 1,
+                f"                      perda de mensagens {config.chaos_drop_rate * 100:.0f}%")
     if sys.stdout.isatty():
         cyan, reset = "\033[36m", "\033[0m"
         lines = [f"{cyan}{line}{reset}" for line in lines]
     print("\n".join(lines))
 
 
-async def _run_session(config: SimConfig, logger: logging.Logger):
+async def _chaos_disconnect_loop(cp: "EVChargerSim", config: SimConfig, logger: logging.Logger):
     """
-    Uma única tentativa de conexão + sessão completa com o CSMS. Se a
-    conexão cair (ou nunca se estabelecer), a exceção sobe para quem
-    chamou decidir se tenta de novo — ver main().
+    Se configurado (--chaos-disconnect-interval), derruba o WebSocket de
+    propósito em intervalos (± jitter) — pra testar a robustez de
+    reconexão/fila offline do seu CSMS sem precisar derrubar o servidor
+    manualmente toda hora. Roda para sempre, independente de
+    reconexões — cada vez que a conexão atual cai (por este loop ou por
+    qualquer outro motivo), o próximo ciclo simplesmente espera de novo
+    antes de derrubar a próxima.
     """
-    url = f"{config.url}/{config.charge_point_id}"
-    logger.info(f"Conectando em {url} ...")
-
-    async with websockets.connect(url, subprotocols=["ocpp1.6"]) as ws:
-        logger.info("🔌 Conectado ao CSMS")
-        cp = EVChargerSim(config.charge_point_id, ws, config, logger)
-
-        # Roda o "listener" do protocolo (escuta mensagens do CSMS) em paralelo
-        # com as rotinas de envio (boot, status, heartbeat, meter values).
-        #
-        # Nota: console_command_loop é recriado a cada (re)conexão. O
-        # input() dele roda numa thread do executor padrão que não pode
-        # ser cancelada de verdade — numa reconexão ela fica parada em
-        # segundo plano até o usuário digitar algo, e só então é
-        # descartada. Inofensivo no uso normal (algumas reconexões
-        # durante um teste manual); não é pensado para reconectar em
-        # loop rápido e indefinido sem nunca reiniciar o processo.
-        await asyncio.gather(
-            cp.start(),
-            cp.simulate_connection_flow(),
-            cp.send_heartbeat_loop(),
-            cp.send_meter_values_loop(interval_seconds=config.meter_values_interval),
-            cp.energy_accumulator_loop(interval_seconds=config.meter_values_interval),
-            cp.console_command_loop(),
+    if config.chaos_disconnect_interval_seconds <= 0:
+        return
+    while True:
+        jitter = random.uniform(
+            -config.chaos_disconnect_jitter_seconds, config.chaos_disconnect_jitter_seconds
         )
+        wait = max(1.0, config.chaos_disconnect_interval_seconds + jitter)
+        await asyncio.sleep(wait)
+        if cp.is_online and cp._connection is not None:
+            logger.warning("[CHAOS] derrubando conexão de propósito (chaos_disconnect_interval)...")
+            try:
+                await cp._connection.close()
+            except Exception:
+                pass  # cp.start()/main() vão detectar a queda e reconectar normalmente
 
 
 async def main(argv=None):
@@ -1826,8 +2261,21 @@ async def main(argv=None):
     teto de 30s, resetando assim que uma conexão fica de pé com sucesso).
     Espelha o comportamento de um charger físico real — se o servidor
     cair ou ainda não estiver no ar, tenta de novo em vez de derrubar o
-    processo. Sem isso, testar cenários de reconexão no dashboard exigia
-    rodar o script manualmente de novo a cada queda.
+    processo.
+
+    IMPORTANTE: a instância de EVChargerSim é criada UMA ÚNICA VEZ, na
+    primeira conexão bem-sucedida, e persiste através de todas as
+    reconexões seguintes — só a conexão WebSocket por baixo dela é
+    trocada (`cp._connection = ws`). Isso é o que permite a uma sessão
+    em andamento (SoC, energia acumulada, fila offline) sobreviver a uma
+    queda de rede em vez de ser apagada a cada reconexão, como acontecia
+    antes (quando uma instância nova era criada em toda tentativa).
+
+    Pelo mesmo motivo, os loops de fundo (heartbeat, meter values,
+    acumulador de energia, console, chaos) também são iniciados UMA VEZ
+    e rodam para sempre — eles não fazem parte do ciclo de
+    conexão/reconexão abaixo, só `cp.start()` (o listener de mensagens
+    do CSMS, que é específico de cada conexão) é.
     """
     config = SimConfig.load(argv)
     logger = build_logger(config.charge_point_id, config.verbose)
@@ -1835,11 +2283,41 @@ async def main(argv=None):
     _print_banner(config)
     backoff = 2
     max_backoff = 30
+    cp: EVChargerSim | None = None
+
     while True:
+        url = f"{config.url}/{config.charge_point_id}"
+        logger.info(f"Conectando em {url} ...")
         try:
-            await _run_session(config, logger)
+            async with websockets.connect(url, subprotocols=["ocpp1.6"]) as ws:
+                logger.info("🔌 Conectado ao CSMS")
+
+                if cp is None:
+                    cp = EVChargerSim(config.charge_point_id, ws, config, logger)
+                    cp.is_online = True
+                    asyncio.create_task(cp.send_heartbeat_loop())
+                    asyncio.create_task(
+                        cp.send_meter_values_loop(interval_seconds=config.meter_values_interval)
+                    )
+                    asyncio.create_task(
+                        cp.energy_accumulator_loop(interval_seconds=config.meter_values_interval)
+                    )
+                    asyncio.create_task(cp.console_command_loop())
+                    asyncio.create_task(_chaos_disconnect_loop(cp, config, logger))
+                    await cp.run_first_boot_sequence()
+                else:
+                    cp._connection = ws
+                    cp.is_online = True
+                    await cp.run_reconnect_sequence()
+
+                backoff = 2
+                # A partir daqui, só o listener de protocolo DESTA conexão
+                # específica é aguardado — as rotinas de fundo já estão
+                # rodando à parte (criadas acima, uma única vez) e
+                # sobrevivem à queda desta conexão sozinhas.
+                await cp.start()
+
             logger.warning("Conexão encerrada pelo CSMS — tentando reconectar...")
-            backoff = 2
         except (OSError, asyncio.TimeoutError,
                 websockets.exceptions.ConnectionClosed,
                 websockets.exceptions.InvalidHandshake) as e:
@@ -1851,6 +2329,9 @@ async def main(argv=None):
             logger.exception(
                 f"Erro inesperado na sessão com o CSMS — nova tentativa em {backoff}s"
             )
+        finally:
+            if cp is not None:
+                cp.is_online = False
 
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, max_backoff)
