@@ -1,58 +1,24 @@
-# EVChargerSim — Simulador de Charge Point OCPP 1.6J
+# EVChargerSim
 
-Simulador standalone do lado "carro/carregador" de um ponto de carga AC
-genérico, usando [mobilityhouse/ocpp](https://github.com/mobilityhouse/ocpp).
-Conecta no seu CSMS real via WebSocket OCPP 1.6J, permitindo testar a
-lógica do servidor (`SetChargingProfile`, `RemoteStartTransaction`,
-balanceamento de carga, reconexão etc.) sem precisar de hardware físico.
+Simulador de Charge Point OCPP 1.6J (usando [mobilityhouse/ocpp](https://github.com/mobilityhouse/ocpp)), pra testar a lógica do seu CSMS real sem precisar de hardware físico. Conecta via WebSocket, simula o lado carro/carregador (bateria, corrente, tapering) e responde à maior parte das mensagens que um CSMS manda em produção.
 
----
-
-## Pré-requisitos
-
-| Requisito | Versão |
-|---|---|
-| Python | 3.10+ |
-| ocpp | 2.1.0 |
-| websockets | 16.0 |
+## Instalação
 
 ```bash
-pip install ocpp==2.1.0 websockets==16.0
+pip install ocpp websockets
 ```
 
----
-
-## Como executar
+## Uso básico
 
 ```bash
-python evchargersim.py
-```
-
-Isso conecta em `ws://localhost:9000` com o ID padrão `EVCHARGERSIM_01`.
-
-### Opções de linha de comando
-
-```bash
-python evchargersim.py [charge_point_id] [--url URL] [--verbose]
-```
-
-| Argumento | Descrição |
-|---|---|
-| `charge_point_id` | ID do charge point (padrão: `EVCHARGERSIM_01`). Posicional e opcional. |
-| `--url` | URL base do CSMS, sem o ID no final (padrão: `ws://localhost:9000`). O ID é sempre anexado automaticamente ao conectar. |
-| `--verbose` | Mostra `Heartbeat` e `GetConfiguration` no terminal — por padrão ficam em nível `DEBUG` (silenciosos), já que repetem sem trazer informação nova a cada ciclo. `MeterValues` aparece sempre, independente desta flag. |
-
-**Exemplos:**
-
-```bash
-python evchargersim.py CARREGADOR_02
+python evchargersim.py                        # ID padrão EVCHARGERSIM_01, conecta em ws://localhost:9000
+python evchargersim.py CARREGADOR_02           # ID customizado
 python evchargersim.py CARREGADOR_02 --url ws://192.168.15.18:9000
-python evchargersim.py --verbose
+python evchargersim.py --config sim.json       # carrega valores padrão de um arquivo JSON
+python evchargersim.py --verbose               # mostra Heartbeat e GetConfiguration no terminal
 ```
 
-### Simulando múltiplos carregadores (load balancing)
-
-Cada instância roda em seu próprio processo/terminal, com seu próprio ID:
+Para testar load balancing entre carregadores, abra um terminal por instância:
 
 ```bash
 python evchargersim.py CARREGADOR_01
@@ -60,83 +26,127 @@ python evchargersim.py CARREGADOR_02
 python evchargersim.py CARREGADOR_03
 ```
 
----
+## Configuração
 
-## Comandos do console interativo
+### Flags de linha de comando
 
-Durante a execução, digite no terminal:
+| Flag | Descrição | Padrão |
+|---|---|---|
+| `charge_point_id` (posicional) | ID do charge point | `EVCHARGERSIM_01` |
+| `--url` | URL base do CSMS (sem o ID no final) | `ws://localhost:9000` |
+| `--config` | Caminho para um arquivo JSON com valores padrão (ver abaixo) | — |
+| `--connector-id` | ID do conector | `1` |
+| `--meter-interval` | Intervalo de MeterValues (segundos) | `30` |
+| `--heartbeat-interval` | Intervalo inicial de Heartbeat (segundos) | `120` |
+| `--default-amps` | Corrente aplicada ao iniciar sessão, antes do primeiro SetChargingProfile | `16.0` |
+| `--sim-speed` | Fator de aceleração do acúmulo de energia/SoC (1.0 = tempo real) | `1.0` |
+| `--battery-wh` | Capacidade da bateria simulada (Wh) | `50000` |
+| `--initial-soc` | SoC inicial de cada sessão (%) | `20.0` |
+| `--voltage` | Tensão nominal de referência (V) | `225.0` |
+| `--call-timeout` | Timeout (segundos) para chamadas críticas (Start/StopTransaction) | `30.0` |
+| `--verbose` | Mostra Heartbeat/GetConfiguration no terminal | desligado |
 
-| Comando | O que faz |
+Flags de instabilidade de rede (chaos) — ver seção própria abaixo:
+
+| Flag | Descrição | Padrão |
+|---|---|---|
+| `--chaos-disconnect-interval` | Derruba o WebSocket a cada N segundos (± jitter) | desligado (`0`) |
+| `--chaos-disconnect-jitter` | Variação (± segundos) em torno do intervalo acima | `5.0` |
+| `--chaos-latency-min` / `--chaos-latency-max` | Atraso artificial (ms) antes de cada envio | desligado (`0`/`0`) |
+| `--chaos-drop-rate` | Probabilidade (0.0–1.0) de uma mensagem ser simulada como perdida | desligado (`0.0`) |
+
+### Arquivo `--config`
+
+JSON com qualquer subconjunto dos campos de `SimConfig` (mesmos nomes dos atributos, não das flags CLI). Exemplo:
+
+```json
+{
+  "charge_point_id": "CARREGADOR_01",
+  "battery_capacity_wh": 75000,
+  "initial_soc_percent": 15,
+  "simulation_speed": 20,
+  "default_offered_amps": 32
+}
+```
+
+**Precedência**: flag de CLI (quando passada) > arquivo `--config` > defaults embutidos. Uma chave desconhecida no arquivo faz o script abortar com uma mensagem de erro listando as chaves válidas.
+
+## Cobertura do protocolo OCPP 1.6
+
+**CSMS → Charge Point** (mensagens que o simulador responde):
+
+`SetChargingProfile` (múltiplos períodos, unidades A e W) · `ClearChargingProfile` · `RemoteStartTransaction` · `RemoteStopTransaction` · `ChangeAvailability` (Operative/Inoperative, com `Scheduled` durante sessão ativa) · `Reset` (soft/hard) · `TriggerMessage` · `GetConfiguration` · `ChangeConfiguration` · `UnlockConnector` · `DataTransfer` · `GetDiagnostics` · `UpdateFirmware` · `ReserveNow` / `CancelReservation` (com expiração automática) · `SendLocalList` / `GetLocalListVersion`
+
+**Charge Point → CSMS** (mensagens espontâneas): `BootNotification` · `StatusNotification` · `Heartbeat` · `MeterValues` (Current.Import/Offered, Voltage, Power.Active.Import, Energy.Active.Import.Register) · `StartTransaction` / `StopTransaction` · `Authorize` · `DiagnosticsStatusNotification` · `FirmwareStatusNotification` · `DataTransfer`
+
+Não coberto: suporte a múltiplos conectores por charge point (um único conector por instância, hoje).
+
+## Comandos do console
+
+Digitados no terminal enquanto o simulador roda:
+
+| Comando | Efeito |
 |---|---|
-| `start <id_tag>` | Simula motorista passando RFID no totem (`Authorize` → `StartTransaction`), sem precisar de `RemoteStart` vindo do CSMS. |
-| `stop` | Simula cliente encerrando a sessão localmente (cabo desconectado / botão no carro) — `Reason.ev_disconnected`. |
-| `pause` | Simula o carro pausando o carregamento (→ `SuspendedEV`). |
-| `resume` | Retoma o carregamento após um `pause` (→ `Charging`). |
-| `fault <código>` | Dispara `StatusNotification` com erro, simulando uma falha de hardware. |
-| `clear` | Limpa uma falha ativa, voltando para `Available`. Necessário depois de um `fault` para poder usar `start` de novo. |
-| `help` | Lista todos os comandos. |
+| `start <id_tag>` | RFID local — autoriza via lista local (se o id_tag estiver nela) ou via `Authorize` remoto, e inicia a sessão. Recusado se o conector estiver reservado para outro id_tag, `Inoperative`, `Faulted`, ou (sem lista local) offline. |
+| `stop` | Cliente encerra a sessão localmente (`Reason.ev_disconnected`) |
+| `pause` | Carro pausa o carregamento → `SuspendedEV` |
+| `resume` | Retoma o carregamento → `Charging` |
+| `fault <código>` | Simula falha de hardware → `Faulted`. Códigos: `ground_failure`, `over_current_failure`, `over_voltage`, `connector_lock_failure`, `power_meter_failure`, `weak_signal`, `other_error` |
+| `clear` | Limpa a falha ativa, volta a `Available` |
+| `datatransfer <vendor_id> [message_id] [data]` | Envia um `DataTransfer` do charger para o CSMS |
+| `queue` | Mostra o conteúdo da fila offline e o status de conectividade atual |
+| `disconnect` | Derruba a conexão WebSocket na hora (gatilho manual de chaos) |
+| `help` | Lista os comandos |
 
-### Códigos de fault válidos
+## Reconexão e fila de transações offline
 
-`ground_failure`, `over_current_failure`, `over_voltage`,
-`connector_lock_failure`, `power_meter_failure`, `weak_signal`,
-`other_error`
+Se a conexão com o CSMS cair (ou ele ainda não estiver de pé), o simulador reconecta automaticamente com backoff exponencial (2s → 4s → 8s... até um teto de 30s).
 
----
+A mesma instância do simulador **persiste através de reconexões** — só a conexão WebSocket por baixo é trocada. Isso significa que:
 
-## Comportamento simulado
+- Uma sessão em andamento continua "fisicamente" rodando enquanto offline: SoC sobe, energia acumula, tudo como se o carro continuasse conectado (que é exatamente o que acontece num charger físico real).
+- Mensagens que não puderam ser enviadas (`StatusNotification`, `MeterValues`, `StartTransaction`, `StopTransaction`) ficam numa fila local e são entregues ao CSMS **em ordem**, assim que a conexão volta.
+- Um `start` local iniciado offline (via lista local — `Authorize` remoto não faz sentido enfileirar, precisa de resposta síncrona) roda a sessão com um **ID de transação temporário negativo**, até o CSMS confirmar um ID real. Qualquer `StopTransaction` enfileirado nesse meio-tempo é corrigido automaticamente para o ID real no momento do flush.
+- `Heartbeat` não é enfileirado (não tem valor reenviar um "ainda estou vivo" atrasado) — é simplesmente pulado enquanto offline.
 
-- **Bateria/SoC**: simula um EV de ~50 kWh começando em 20% a cada sessão,
-  com *tapering* (queda de corrente conforme a bateria se aproxima de
-  100%, mais perceptível acima de ~80% de SoC). Ao atingir 100%, encerra
-  a sessão automaticamente.
-- **RemoteStartTransaction**: não reautoriza localmente por padrão — isso
-  é o comportamento correto da OCPP 1.6 quando `AuthorizeRemoteTxRequests`
-  não está habilitado (o autor já é validado pelo backend antes do comando
-  remoto ser disparado). Já o comando `start` do console (RFID local)
-  *sempre* chama `Authorize.req` primeiro, como um totem físico faria.
-- **HeartbeatInterval**: sincronizado com o CSMS via
-  `ChangeConfiguration`/`GetConfiguration` — mudanças feitas pelo servidor
-  têm efeito imediato no próximo ciclo.
-- **Reconexão automática**: se a conexão com o CSMS cair (ou ele ainda não
-  estiver no ar), o simulador tenta reconectar com backoff exponencial
-  (2s → 4s → 8s ... até um teto de 30s), sem precisar reiniciar o
-  processo manualmente.
+Use o comando de console `queue` para inspecionar o que está pendente a qualquer momento.
 
----
+**Limitação conhecida**: o protocolo OCPP 1.6 não tem um mecanismo de deduplicação embutido. Se a conexão cair depois do CSMS já ter processado uma mensagem mas antes da confirmação chegar ao simulador, um reenvio no próximo flush pode registrar a mesma transação duas vezes do lado do servidor. Isso é uma limitação real do protocolo, não só deste simulador.
 
-## Aparência do terminal
+## Instabilidade de rede injetável (chaos)
 
-- Timestamp, ID do charge point e nível de log (INFO/WARNING/ERROR) saem
-  em cores diferentes da mensagem em si, para facilitar leitura. Desativa
-  automaticamente quando a saída não é um terminal real (ex: redirecionada
-  para um arquivo).
-- `MeterValues` mostra uma barra de progresso do SoC (`🔋 [██████░░░░] 62%`)
-  colorida conforme o estado: verde carregando, amarelo suspenso, cinza
-  sem sessão, vermelho em falha.
-- Eventos principais (conectado, sessão iniciada/encerrada, fault/clear,
-  pause/resume) têm ícones (🔌⚡🛑⚠️✅⏸️▶️) para escanear o log de relance.
+Para testar a robustez do seu CSMS sem depender de uma queda real de rede:
 
----
+```bash
+# Derruba o WebSocket a cada ~60s (± jitter)
+python evchargersim.py --chaos-disconnect-interval 60
 
-## Configurações editáveis
+# Atraso artificial de 200-2000ms antes de cada mensagem enviada
+python evchargersim.py --chaos-latency-min 200 --chaos-latency-max 2000
 
-No topo do arquivo `evchargersim.py`:
+# 10% das mensagens são simuladas como perdidas na rede
+python evchargersim.py --chaos-drop-rate 0.1
+```
 
-| Constante | Descrição |
-|---|---|
-| `CONNECTOR_ID` | Conector simulado (padrão: 1). |
-| `METER_VALUES_INTERVAL` | Intervalo de `MeterValues`, em segundos (padrão: 30). |
-| `HEARTBEAT_INTERVAL` | Intervalo inicial de `Heartbeat`, em segundos (padrão: 120). |
-| `DEFAULT_OFFERED_AMPS` | Corrente aplicada ao iniciar sessão, antes do primeiro `SetChargingProfile` (padrão: 16A). |
-| `BATTERY_CAPACITY_WH` | Capacidade da bateria simulada (padrão: 50.000 Wh). |
-| `INITIAL_SOC_PERCENT` | SoC inicial de cada sessão (padrão: 20%). |
+As flags podem ser combinadas. O comando de console `disconnect` derruba a conexão manualmente a qualquer momento, sem precisar de `--chaos-disconnect-interval`.
 
----
+Tudo isso é opt-in — desligado por padrão, sem mudar o comportamento de quem não passar essas flags.
 
-## Requisitos futuros / limitações conhecidas
+## Multi-instância (load balancing)
 
-- `SIMULATION_SPEED` está declarado mas não tem efeito ainda — reservado
-  para uma futura aceleração do acumulador de energia/SoC.
-- Cada processo simula **um único** charge point. Para vários
-  carregadores, rode uma instância por terminal (ver seção acima).
+Cada instância do simulador é independente — rode várias em paralelo (terminais separados, ou um `--config` diferente por instância) para simular um site com múltiplos carregadores.
+
+## Testes
+
+```bash
+python -m unittest test_evchargersim.py -v
+```
+
+Cobre as funções puras (tapering de corrente, cores/formatação), o roteamento de perfis de carga com múltiplos períodos, `ChangeAvailability`, `ClearChargingProfile`, reserva/lista local, e o ciclo completo de fila offline (incluindo reconciliação de ID local → real e recuperação de uma queda no meio do flush). Não cobre os loops assíncronos diretamente (heartbeat/meter values/console) nem uma integração real contra um WebSocket — os testes substituem `self.call` por um stub e chamam os métodos diretamente.
+
+## Limitações conhecidas
+
+- **Um conector por charge point.** Simular uma estação com 2+ conectores exigiria `ChargerState` por conector e roteamento de `connector_id` em cada handler — não implementado.
+- **`ClearChargingProfile`/`SetChargingProfile` não filtram por `chargingProfileId`/`stackLevel`/`connectorId`** — qualquer `SetChargingProfile` recebido substitui o perfil ativo por completo.
+- **Sem deduplicação de mensagens reenviadas** pela fila offline (ver seção acima) — limitação do protocolo, não do simulador.
+- **`GetDiagnostics`/`UpdateFirmware`/`DataTransfer` não passam pela fila offline** — se offline no momento em que o CSMS tentaria disparar esses fluxos, eles simplesmente não seriam recebidos (mas isso já é esperado: são iniciados pelo CSMS, que só consegue mandar a mensagem se a conexão estiver de pé).
