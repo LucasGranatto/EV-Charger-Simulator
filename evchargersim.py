@@ -55,6 +55,7 @@ from ocpp.v16.enums import (
     CancelReservationStatus,
     ChargePointErrorCode,
     ChargePointStatus,
+    ClearCacheStatus,
     DataTransferStatus,
     DiagnosticsStatus,
     FirmwareStatus,
@@ -608,6 +609,14 @@ class EVChargerSim(BaseChargePoint):
                     f"[FILA OFFLINE] ID local {local_tx_id} resolvido para "
                     f"transaction_id real {real_id}"
                 )
+                if not self._start_transaction_authorized(response):
+                    tag_status = response.id_tag_info.get("status")
+                    self.log.warning(
+                        f"[FILA OFFLINE] StartTransaction confirmado mas "
+                        f"id_tag_info.status={tag_status} — abortando a sessão "
+                        "que já rodava offline, StopTransaction imediato."
+                    )
+                    asyncio.create_task(self._send_stop_transaction(real_id, reason=Reason.other))
 
         self.log.info("[FILA OFFLINE] todas as mensagens pendentes foram entregues.")
 
@@ -1151,16 +1160,38 @@ class EVChargerSim(BaseChargePoint):
         )
         return call_result.SendLocalList(status=UpdateStatus.accepted)
 
+    @on(Action.clear_cache)
+    async def on_clear_cache(self, **kwargs):
+        """
+        Limpa a Authorization Cache — que no protocolo é conceitualmente
+        separada da lista local de autorização (local_auth_list, gerida
+        por SendLocalList/GetLocalListVersion). Este simulador não mantém
+        um cache de Authorize.conf à parte hoje, então não há estado pra
+        limpar aqui; ainda assim expõe o handler (em vez de deixar cair
+        no NotImplemented padrão da lib) porque ClearCache é uma das
+        chamadas CSMS->CP mais comumente testadas.
+        """
+        self.log.info("[CLEAR CACHE] solicitado pelo CSMS — nenhum cache de autorização separado para limpar.")
+        return call_result.ClearCache(status=ClearCacheStatus.accepted)
+
     # --------------------------------------------------------
     # Rotinas que o charge point envia PARA o CSMS
     # --------------------------------------------------------
 
-    async def send_boot_notification(self):
+    async def send_boot_notification(self) -> tuple[bool, float]:
         """
         Não reseta SoC/is_faulted aqui — a mesma instância persiste
         através de reconexões (ver main()), então isso apagaria uma
         sessão/falha real em andamento. queueable=False: offline já é
         tratado pelo laço de reconexão em main().
+
+        Retorna (accepted, retry_after_seconds). Em Accepted, o campo
+        `interval` da resposta é aplicado como o heartbeat interval
+        (é o comportamento definido pelo protocolo — o CSMS usa
+        BootNotification pra sincronizar isso, não só ChangeConfiguration).
+        Em Pending/Rejected, o mesmo campo `interval` diz quanto esperar
+        antes de tentar de novo; quem decide se/quantas vezes tentar de
+        novo é o chamador (run_first_boot_sequence / run_reconnect_sequence).
         """
         request = call.BootNotification(
             charge_point_model="EVChargerSim",
@@ -1169,11 +1200,23 @@ class EVChargerSim(BaseChargePoint):
         )
         response = await self._call_or_queue(request, kind="BootNotification", queueable=False)
         if response is None:
-            return
+            return False, 10.0
         if response.status == RegistrationStatus.accepted:
-            self.log.info("BootNotification aceito pelo CSMS.")
-        else:
-            self.log.warning(f"BootNotification respondido com status: {response.status}")
+            if response.interval and response.interval > 0:
+                self.state.current_heartbeat_interval = response.interval
+                self.log.info(
+                    f"BootNotification aceito pelo CSMS — heartbeat ajustado "
+                    f"para {response.interval}s (definido pelo CSMS)."
+                )
+            else:
+                self.log.info("BootNotification aceito pelo CSMS.")
+            return True, 0.0
+        retry_after = response.interval if response.interval and response.interval > 0 else 10.0
+        self.log.warning(
+            f"BootNotification respondido com status={response.status} — "
+            f"CSMS ainda não aceitou o registro, nova tentativa em {retry_after:.0f}s."
+        )
+        return False, retry_after
 
     async def send_status_notification(self, status: str):
         request = call.StatusNotification(
@@ -1184,6 +1227,19 @@ class EVChargerSim(BaseChargePoint):
         response = await self._call_or_queue(request, kind=f"StatusNotification({status})")
         if response is not None:
             self.log.info(f"StatusNotification enviado: {status}")
+
+    @staticmethod
+    def _start_transaction_authorized(response) -> bool:
+        """
+        True se a StartTransactionResponse veio com id_tag_info.status
+        Accepted. Isso é ortogonal a "o CSMS respondeu" — um CSMS pode
+        aceitar a chamada RPC (e devolver um transaction_id de verdade)
+        e ainda assim recusar o id_tag (Invalid/Blocked/Expired/
+        ConcurrentTx), caso em que um carregador real não entrega
+        energia mesmo com a transação já registrada do lado do servidor.
+        """
+        status = (response.id_tag_info or {}).get("status", AuthorizationStatus.accepted)
+        return status == AuthorizationStatus.accepted
 
     async def _send_start_transaction(self, connector_id: int, id_tag: str):
         """
@@ -1245,6 +1301,18 @@ class EVChargerSim(BaseChargePoint):
 
             if response is not None:
                 state.active_transaction_id = response.transaction_id
+                if not self._start_transaction_authorized(response):
+                    tag_status = response.id_tag_info.get("status")
+                    self.log.warning(
+                        f"[START TRANSACTION] CSMS registrou a transação "
+                        f"(transaction_id={state.active_transaction_id}) mas "
+                        f"id_tag_info.status={tag_status} — abortando sem "
+                        "entregar energia, StopTransaction imediato."
+                    )
+                    asyncio.create_task(
+                        self._send_stop_transaction(state.active_transaction_id, reason=Reason.other)
+                    )
+                    return
                 self.log.info(
                     f"⚡ [START TRANSACTION] aceito pelo CSMS | "
                     f"transaction_id={state.active_transaction_id} | id_tag={id_tag}"
@@ -1863,10 +1931,31 @@ class EVChargerSim(BaseChargePoint):
         """
         Primeira conexão: fica em Available até um RemoteStart/"start"
         local — _send_start_transaction avança pra Charging depois.
+
+        Só avança para StatusNotification depois de um BootNotification
+        Accepted — em Pending/Rejected um charger real não se apresenta
+        como disponível, só fica retentando no intervalo que o CSMS mandou.
         """
-        await self.send_boot_notification()
+        if not await self._boot_until_accepted():
+            return  # ficou offline no meio das tentativas; main() reconecta e chama de novo
         await asyncio.sleep(1)
         await self.send_status_notification(ChargePointStatus.available)
+
+    async def _boot_until_accepted(self) -> bool:
+        """
+        Repete BootNotification até Accepted, esperando entre tentativas
+        o `interval` que o próprio CSMS mandou na resposta (fallback 10s
+        se o CSMS não mandar nada útil). Para de tentar se a conexão cair
+        no meio — quem trata a reconexão é o laço em main(), que chama
+        run_reconnect_sequence (e portanto isso de novo) quando voltar.
+        """
+        while True:
+            accepted, retry_after = await self.send_boot_notification()
+            if accepted:
+                return True
+            if not self.is_online:
+                return False
+            await asyncio.sleep(retry_after)
 
     async def run_reconnect_sequence(self):
         """
@@ -1878,7 +1967,8 @@ class EVChargerSim(BaseChargePoint):
         self.log.info(
             "[RECONEXÃO] reenviando BootNotification e esvaziando fila offline..."
         )
-        await self.send_boot_notification()
+        if not await self._boot_until_accepted():
+            return  # caiu de novo durante as tentativas; main() chama de novo ao reconectar
         await self._flush_offline_queue()
 
         state = self.state
