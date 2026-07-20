@@ -6,7 +6,7 @@ seu CSMS real via WebSocket, pra testar a lógica do servidor sem
 hardware físico.
 
 Uso:
-    python evchargersim.py                             # ID padrão, ws://localhost:9000
+    python evchargersim.py                             # ID padrão, ws://localhost:9001
     python evchargersim.py CARREGADOR_02 --url ws://host:9000
     python evchargersim.py --config sim.json            # valores padrão via JSON (ver SimConfig)
     python evchargersim.py --verbose                    # mostra Heartbeat/GetConfiguration
@@ -94,7 +94,7 @@ class SimConfig:
     (JSON) > defaults abaixo.
     """
     charge_point_id: str = "EVCHARGERSIM_01"
-    url: str = "ws://localhost:9000"
+    url: str = "ws://localhost:9001"
     verbose: bool = False
     connector_id: int = 1
 
@@ -181,7 +181,7 @@ def _parse_args(argv=None):
     parser.add_argument("charge_point_id", nargs="?", default=None,
                          help="ID do charge point (padrão: EVCHARGERSIM_01).")
     parser.add_argument("--url", default=None,
-                         help="URL base do CSMS, sem o ID (padrão: ws://localhost:9000).")
+                         help="URL base do CSMS, sem o ID (padrão: ws://localhost:9001).")
     parser.add_argument("--config", default=None,
                          help="Arquivo JSON com valores padrão (ver SimConfig). CLI tem prioridade.")
     parser.add_argument("--connector-id", type=int, default=None)
@@ -440,6 +440,36 @@ class EVChargerSim(BaseChargePoint):
         # queda/reconexão; a instância inteira persiste entre elas.
         self.is_online: bool = False
         self._local_tx_counter: int = 0
+
+        # Guarda "um início de sessão já está em andamento" — cobre a
+        # janela entre aceitar um RemoteStart/start local e
+        # active_transaction_id ser de fato gravado em
+        # _send_start_transaction. SEM isso, um segundo
+        # RemoteStartTransaction (ex.: reenviado pelo próprio CSMS após
+        # seu client-side timeout, enquanto o primeiro ainda nem tinha
+        # terminado) passa pelo guard `active_transaction_id is not
+        # None` porque esse campo ainda está vazio, e dispara uma SEGUNDA
+        # _send_start_transaction concorrente — resultando em dois
+        # StartTransaction completos pro mesmo conector físico. Ver
+        # _try_begin_start/_end_start.
+        self._start_in_progress: bool = False
+
+    def _try_begin_start(self) -> bool:
+        """
+        Tenta reservar "iniciando sessão" de forma atômica (sem await
+        entre o check e o set — por isso é um método síncrono comum,
+        não uma coroutine, e deve ser chamado ANTES de qualquer await
+        no fluxo de start). Retorna False se já há um início em
+        andamento; quem chama deve recusar o pedido nesse caso.
+        """
+        if self._start_in_progress:
+            return False
+        self._start_in_progress = True
+        return True
+
+    def _end_start(self):
+        """Libera a reserva de _try_begin_start — SEMPRE via finally, em qualquer desfecho."""
+        self._start_in_progress = False
 
     # --------------------------------------------------------
     # Handlers de mensagens recebidas do CSMS
@@ -748,6 +778,20 @@ class EVChargerSim(BaseChargePoint):
             return call_result.RemoteStartTransaction(status=RemoteStartStopStatus.rejected)
         if state.is_faulted:
             self.log.warning("[REMOTE START] charger em Faulted — recusando.")
+            return call_result.RemoteStartTransaction(status=RemoteStartStopStatus.rejected)
+        if not self._try_begin_start():
+            # active_transaction_id só é gravado dentro de
+            # _send_start_transaction — antes disso, o guard acima não
+            # pega um segundo RemoteStart que chegue enquanto o primeiro
+            # ainda está a caminho (ex.: o próprio CSMS reenviando após
+            # dar timeout na resposta dele, sem cancelar a tentativa
+            # anterior). Sem este guard, os dois seguem em paralelo e o
+            # CSMS acaba com duas transações completas pro mesmo conector.
+            self.log.warning(
+                "[REMOTE START] já existe um início de sessão em andamento "
+                "(aguardando StartTransaction confirmar) — recusando para "
+                "evitar StartTransaction duplicado."
+            )
             return call_result.RemoteStartTransaction(status=RemoteStartStopStatus.rejected)
 
         # Dispara o envio de StartTransaction em background, DEPOIS de responder
@@ -1347,6 +1391,12 @@ class EVChargerSim(BaseChargePoint):
                 "[START TRANSACTION] erro inesperado — sessão pode não ter "
                 "sido registrada corretamente."
             )
+        finally:
+            # A partir daqui active_transaction_id (real ou o ID local
+            # temporário) já reflete o desfecho, e esse campo é quem passa
+            # a bloquear um novo start — libera a reserva feita por
+            # _try_begin_start em on_remote_start_transaction/console.
+            self._end_start()
 
     async def _send_stop_transaction(
         self,
@@ -1667,6 +1717,12 @@ class EVChargerSim(BaseChargePoint):
                         "CSMS) — sessão não pode ser iniciada."
                     )
                     continue
+                if not self._try_begin_start():
+                    self.log.warning(
+                        "[CONSOLE] já existe um início de sessão em andamento "
+                        "— aguarde confirmar antes de tentar de novo."
+                    )
+                    continue
                 id_tag = parts[1] if len(parts) > 1 else "LOCAL_TAG"
                 # Conector reservado: só o id_tag (ou parent_id_tag) da
                 # reserva pode iniciar sessão — qualquer outro é recusado
@@ -1864,6 +1920,14 @@ class EVChargerSim(BaseChargePoint):
             await self._send_start_transaction(connector_id, id_tag)
         except Exception:
             self.log.exception("[LOCAL START] Falha no fluxo de autorização local.")
+        finally:
+            # Cobre os returns antecipados acima (offline, Authorize sem
+            # resposta, id_tag recusado) — nesses casos _send_start_transaction
+            # nunca roda, então ninguém mais soltaria a reserva feita pelo
+            # comando "start" no console antes de chamar esta função.
+            # Chamar de novo depois de _send_start_transaction já ter
+            # soltado é inofensivo (_end_start só zera a flag).
+            self._end_start()
 
     async def _send_fault_notification(self, error_code: ChargePointErrorCode):
         """
