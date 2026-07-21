@@ -515,66 +515,110 @@ class EVChargerSim(BaseChargePoint):
         kind: str,
         queueable: bool = True,
         timeout: float | None = None,
-        queue_on_timeout: bool = False,
         local_tx_id: int | None = None,
+        return_queued: bool = False,
     ):
         """
         Ponto único por onde toda mensagem espontânea do charger
         (StatusNotification, MeterValues, Heartbeat, Start/StopTransaction)
         passa antes de sair pela rede. Duas responsabilidades:
 
-        1) Fila offline: se sem conexão (ou perde ela na tentativa),
-           mensagens queueable=True são guardadas em vez de falhar — ver
-           _flush_offline_queue. Heartbeat usa queueable=False: só é
-           pulado offline, sem acumular.
+        1) Fila offline: SÓ enfileira quando a mensagem de fato não saiu
+           pela rede — offline já na entrada, chaos derrubando antes de
+           tentar, ou a conexão caindo durante a tentativa
+           (ConnectionClosed/OSError). Um simples asyncio.TimeoutError
+           NÃO enfileira mais: a mensagem já tinha sido enviada (self.call
+           manda o CALL antes de esperar a resposta) e o socket continua
+           de pé — não há como saber se o CSMS recebeu/processou.
+           Reenviar a mesma Start/StopTransaction nessa hora é o jeito
+           mais fácil de o CSMS acabar com uma transação fantasma
+           duplicada, caso ele só estivesse lento (não caído) — visto na
+           prática contra um CSMS real que ocasionalmente estourava
+           call_timeout_seconds só de lento, e cada timeout virava um
+           reenvio silencioso registrado como uma segunda sessão pro
+           mesmo conector. Ver _send_start_transaction/_send_stop_transaction
+           pra como o "sem resposta, mas sem reenviar" é tratado.
         2) Chaos: latência artificial e perda simulada (SimConfig.chaos_*)
-           são aplicadas aqui, antes de qualquer tentativa de envio.
+           são aplicadas aqui, antes de qualquer tentativa de envio — mas
+           só quando há de fato uma conexão pra "perturbar" (offline
+           checado primeiro, ver abaixo).
 
-        queue_on_timeout=True trata um simples "CSMS não respondeu" como
-        motivo pra enfileirar (usado em Start/StopTransaction — não dá
-        pra desistir de registrar uma transação); mensagens periódicas
-        deixam o default False (reenviar uma leitura velha não compensa).
+        return_queued=True muda o retorno para (response, queued) — só os
+        dois chamadores que precisam saber se a mensagem foi de fato
+        salva pra reenvio usam isso (_send_start_transaction/
+        _send_stop_transaction), pra decidir como representar uma sessão
+        cujo destino no CSMS ficou desconhecido. Todo o resto continua
+        recebendo só `response | None`, como sempre.
 
         Retorna a resposta do CSMS, ou None se enfileirada, descartada
         (chaos) ou sem resposta a tempo.
         """
+        def _result(response, queued):
+            return (response, queued) if return_queued else response
+
         timeout = timeout if timeout is not None else self.config.call_timeout_seconds
 
-        # Chaos: atraso artificial antes de sequer tentar enviar.
-        if self.config.chaos_latency_max_ms > 0:
-            delay_ms = random.uniform(
-                self.config.chaos_latency_min_ms, self.config.chaos_latency_max_ms
-            )
-            if delay_ms > 0:
-                await asyncio.sleep(delay_ms / 1000)
+        # Offline de verdade: chaos não tem nada pra perturbar aqui — a
+        # mensagem já não ia sair mesmo. Resolver isso primeiro evita
+        # pagar latência/drop artificiais em cima de algo que já está
+        # simplesmente sem conexão.
+        if not self.is_online:
+            if queueable:
+                self._enqueue_offline(kind, request, local_tx_id=local_tx_id)
+                return _result(None, True)
+            self.log.debug(f"[OFFLINE] '{kind}' pulado (não crítico, não enfileirável).")
+            return _result(None, False)
 
-        # Chaos: perda de mensagem simulada — nunca tentamos enviar de verdade.
+        # Chaos: perda de mensagem simulada — a mensagem nunca chega a
+        # sair, então enfileirar é seguro (equivalente a estar offline).
         if self.config.chaos_drop_rate > 0 and random.random() < self.config.chaos_drop_rate:
             self.log.warning(f"[CHAOS] '{kind}' descartado (perda de rede simulada).")
             if queueable:
                 self._enqueue_offline(kind, request, local_tx_id=local_tx_id)
-            return None
+                return _result(None, True)
+            return _result(None, False)
 
-        if not self.is_online:
-            if queueable:
-                self._enqueue_offline(kind, request, local_tx_id=local_tx_id)
-            else:
-                self.log.debug(f"[OFFLINE] '{kind}' pulado (não crítico, não enfileirável).")
-            return None
+        # Chaos: atraso artificial, contabilizado DENTRO do orçamento de
+        # timeout (não somado por fora) — chaos_latency_max_ms acima de
+        # call_timeout_seconds simula "o CSMS não respondeu a tempo".
+        remaining_timeout = timeout
+        if self.config.chaos_latency_max_ms > 0:
+            delay_ms = random.uniform(
+                self.config.chaos_latency_min_ms, self.config.chaos_latency_max_ms
+            )
+            delay_s = delay_ms / 1000
+            if delay_s >= remaining_timeout:
+                await asyncio.sleep(remaining_timeout)
+                self.log.warning(
+                    f"[CSMS] '{kind}' não teve resposta em {timeout}s (orçamento "
+                    "consumido por latência simulada — chaos_latency)."
+                )
+                return _result(None, False)
+            if delay_s > 0:
+                await asyncio.sleep(delay_s)
+                remaining_timeout -= delay_s
 
         try:
-            return await asyncio.wait_for(self.call(request), timeout=timeout)
+            response = await asyncio.wait_for(self.call(request), timeout=remaining_timeout)
+            return _result(response, False)
         except asyncio.TimeoutError:
-            self.log.warning(f"[CSMS] '{kind}' não teve resposta em {timeout}s.")
-            if queueable and queue_on_timeout:
-                self._enqueue_offline(kind, request, local_tx_id=local_tx_id)
-            return None
+            # A mensagem SAIU e o socket segue de pé — não sabemos se o
+            # CSMS recebeu/processou. Deliberadamente NÃO enfileira (ver
+            # docstring): quem chama decide como lidar com "sem resposta,
+            # conexão ok".
+            self.log.warning(
+                f"[CSMS] '{kind}' não teve resposta em {timeout}s — conexão "
+                "segue online, então NÃO reenviando automaticamente (o CSMS "
+                "pode só estar lento, não ter perdido a mensagem)."
+            )
+            return _result(None, False)
         except (websockets.exceptions.ConnectionClosed, OSError) as exc:
             self.log.warning(f"[OFFLINE] conexão perdida enviando '{kind}' ({exc!r}).")
             self.is_online = False
             if queueable:
                 self._enqueue_offline(kind, request, local_tx_id=local_tx_id)
-            return None
+                return _result(None, True)
+            return _result(None, False)
 
     async def _flush_offline_queue(self):
         """
@@ -1333,13 +1377,16 @@ class EVChargerSim(BaseChargePoint):
                 meter_start=int(state.energy_meter_wh),
                 timestamp=datetime.now(timezone.utc).isoformat(),
             )
-            # queue_on_timeout=True: não dá pra desistir de registrar
-            # uma transação que fisicamente já está em andamento.
-            response = await self._call_or_queue(
+            # return_queued=True: precisamos saber SE foi enfileirada de
+            # verdade (offline/chaos/conexão caiu — mensagem nunca saiu,
+            # reenviar depois é seguro) ou se só deu timeout com a conexão
+            # de pé (mensagem saiu, destino desconhecido — NÃO reenviar
+            # sozinho, ver _call_or_queue).
+            response, queued = await self._call_or_queue(
                 request,
                 kind="StartTransaction",
                 queueable=True,
-                queue_on_timeout=True,
+                return_queued=True,
                 local_tx_id=local_id,
             )
 
@@ -1361,14 +1408,36 @@ class EVChargerSim(BaseChargePoint):
                     f"⚡ [START TRANSACTION] aceito pelo CSMS | "
                     f"transaction_id={state.active_transaction_id} | id_tag={id_tag}"
                 )
-            else:
-                # queueable=True + queue_on_timeout=True cobre todo
-                # caminho de falha — None aqui sempre significa enfileirado.
+            elif queued:
+                # Realmente offline (ou chaos derrubou a mensagem, ou a
+                # conexão caiu na tentativa) — nunca chegou no CSMS, então
+                # reenviar no próximo flush é seguro e necessário.
                 state.active_transaction_id = local_id
                 self.log.warning(
                     f"[FILA OFFLINE] StartTransaction enfileirado — sessão "
                     f"rodando localmente com ID temporário {local_id} até "
                     "reconectar e confirmar com o CSMS."
+                )
+            else:
+                # Timeout com a conexão de pé: a mensagem SAIU e não
+                # sabemos se o CSMS processou. A sessão roda localmente
+                # com o ID temporário (fisicamente o carro já está
+                # carregando), mas DELIBERADAMENTE sem reenvio automático
+                # — reenviar arriscaria uma transação duplicada do lado
+                # do CSMS se ele só estivesse lento, não caído (é
+                # exatamente esse cenário que gerou o bug original desta
+                # correção). Limitação inerente do OCPP 1.6 (sem
+                # idempotência) — não tem como o simulador resolver isso
+                # sozinho sem arriscar duplicar; fica registrado como
+                # ERROR porque merece atenção manual do operador.
+                state.active_transaction_id = local_id
+                self.log.error(
+                    f"[START TRANSACTION] sem resposta do CSMS em "
+                    f"{self.config.call_timeout_seconds}s (conexão segue "
+                    f"online) — sessão rodando localmente com ID temporário "
+                    f"{local_id}, SEM confirmação do CSMS e SEM reenvio "
+                    "automático (evita duplicar a transação do lado dele). "
+                    "Verifique manualmente se o CSMS registrou esta sessão."
                 )
 
             # Sessão consome a reserva do conector, se houver uma.
@@ -1436,15 +1505,16 @@ class EVChargerSim(BaseChargePoint):
                 transaction_id=transaction_id,
                 reason=reason,
             )
-            # queue_on_timeout=True: a sessão já parou de verdade, não dá
-            # pra desistir de avisar o CSMS. local_tx_id permite ao
-            # flush corrigir a referência se o Start correspondente
+            # return_queued=True: só pra logar com precisão se isto foi
+            # de fato salvo pra reenvio (offline/chaos/conexão caiu) ou
+            # se só deu timeout com a conexão de pé — local_tx_id permite
+            # ao flush corrigir a referência se o Start correspondente
             # também ainda não foi confirmado.
-            response = await self._call_or_queue(
+            response, queued = await self._call_or_queue(
                 request,
                 kind="StopTransaction",
                 queueable=True,
-                queue_on_timeout=True,
+                return_queued=True,
                 local_tx_id=local_id_being_stopped,
             )
             if response is not None:
@@ -1452,11 +1522,27 @@ class EVChargerSim(BaseChargePoint):
                     f"🛑 [STOP TRANSACTION] enviado | transaction_id={transaction_id}"
                     + (f" | motivo={reason.value}" if reason else "")
                 )
-            else:
+            elif queued:
                 self.log.warning(
                     f"[FILA OFFLINE] StopTransaction enfileirado "
                     f"(transaction_id={transaction_id}) — será entregue ao "
                     "CSMS na próxima reconexão."
+                )
+            else:
+                # Timeout com a conexão de pé: a mensagem SAIU e não
+                # sabemos se o CSMS processou — mas a sessão já parou de
+                # verdade localmente (contator aberto no topo da função),
+                # então NÃO reenviamos automaticamente pelo mesmo motivo
+                # do StartTransaction: se o CSMS só estava lento (não
+                # caído), reenviar arrisca ele processar duas vezes o
+                # encerramento da mesma transação.
+                self.log.error(
+                    f"[STOP TRANSACTION] sem resposta do CSMS em "
+                    f"{self.config.call_timeout_seconds}s (conexão segue "
+                    f"online) — sessão já encerrada localmente (transaction_id="
+                    f"{transaction_id}), mas SEM confirmação do CSMS e SEM "
+                    "reenvio automático. Verifique manualmente se o CSMS "
+                    "registrou o encerramento desta sessão."
                 )
 
             if skip_status_flow:
@@ -2112,8 +2198,12 @@ async def main(argv=None):
     permite a uma sessão em andamento (SoC, energia, fila offline)
     sobreviver a uma queda de rede. Pelo mesmo motivo, os loops de
     fundo (heartbeat, meter values, acumulador, console, chaos) também
-    são iniciados uma vez e rodam pra sempre — só `cp.start()`
-    (listener específico de cada conexão) faz parte do ciclo abaixo.
+    são iniciados uma vez e rodam pra sempre.
+
+    cp.start() (o listener desta conexão específica) é lançado como
+    task ANTES de esperar o boot/reconexão, não depois — precisa estar
+    rodando pra sequer entregar a resposta do próprio BootNotification
+    (ver comentário no laço abaixo).
     """
     config = SimConfig.load(argv)
     logger = build_logger(config.charge_point_id, config.verbose)
@@ -2126,11 +2216,13 @@ async def main(argv=None):
     while True:
         url = f"{config.url}/{config.charge_point_id}"
         logger.info(f"Conectando em {url} ...")
+        listener_task = None
         try:
             async with websockets.connect(url, subprotocols=["ocpp1.6"]) as ws:
                 logger.info("🔌 Conectado ao CSMS")
 
-                if cp is None:
+                first_connection = cp is None
+                if first_connection:
                     cp = EVChargerSim(config.charge_point_id, ws, config, logger)
                     cp.is_online = True
                     asyncio.create_task(cp.send_heartbeat_loop())
@@ -2142,16 +2234,37 @@ async def main(argv=None):
                     )
                     asyncio.create_task(cp.console_command_loop())
                     asyncio.create_task(_chaos_disconnect_loop(cp, config, logger))
-                    await cp.run_first_boot_sequence()
                 else:
                     cp._connection = ws
                     cp.is_online = True
+
+                # cp.start() PRECISA rodar em paralelo com o boot/reconexão,
+                # nunca depois — é o listener que entrega toda CALLRESULT
+                # recebida (inclusive a resposta do próprio
+                # BootNotification) pra quem está esperando via
+                # self.call(). Chamar run_first_boot_sequence/
+                # run_reconnect_sequence ANTES de start() estar rodando é
+                # um deadlock: _boot_until_accepted não retorna sem uma
+                # resposta, e a resposta nunca chega sem alguém lendo o
+                # socket — trava pra sempre, e por tabela NADA MAIS
+                # (heartbeat, meter values, Authorize, o que for) recebe
+                # resposta nenhuma daí em diante, já que é o mesmo listener
+                # que entrega tudo. (Isso passou despercebido antes porque
+                # o boot original tentava só uma vez e seguia em frente
+                # mesmo sem resposta; virou travamento permanente quando
+                # o retry-até-Accepted foi adicionado.)
+                listener_task = asyncio.create_task(cp.start())
+
+                if first_connection:
+                    await cp.run_first_boot_sequence()
+                else:
                     await cp.run_reconnect_sequence()
 
                 backoff = 2
-                # Rotinas de fundo já rodam à parte (criadas acima uma
-                # vez) e sobrevivem à queda desta conexão sozinhas.
-                await cp.start()
+                # Rotinas de fundo (heartbeat/meter/acumulador/console/chaos)
+                # já rodam à parte desde a primeira conexão; só falta
+                # esperar o listener desta conexão específica encerrar.
+                await listener_task
 
             logger.warning("Conexão encerrada pelo CSMS — tentando reconectar...")
         except (OSError, asyncio.TimeoutError,
@@ -2168,6 +2281,15 @@ async def main(argv=None):
         finally:
             if cp is not None:
                 cp.is_online = False
+            # Cobre saídas por exceção do boot/reconexão (não do próprio
+            # listener) — sem isso, cp.start() ficaria rodando sozinho,
+            # órfão, em cima de uma conexão que main() já desistiu.
+            if listener_task is not None and not listener_task.done():
+                listener_task.cancel()
+                try:
+                    await listener_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, max_backoff)
