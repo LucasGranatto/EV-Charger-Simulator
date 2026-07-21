@@ -454,6 +454,27 @@ class EVChargerSim(BaseChargePoint):
         # _try_begin_start/_end_start.
         self._start_in_progress: bool = False
 
+        # Sinaliza pra _send_start_transaction que, assim que
+        # active_transaction_id resolver (sucesso, enfileirado, ou
+        # timeout sem confirmação), a sessão deve ser encerrada
+        # IMEDIATAMENTE em vez de seguir pra Charging — usado por
+        # on_reset quando o Reset chega enquanto o start ainda está em
+        # andamento (active_transaction_id ainda None, então o guard
+        # "sessão ativa" normal do on_reset não vê nada pra parar ainda).
+        # Sem isso, um Reset nesse instante exato é silenciosamente
+        # ignorado pela sessão que só termina de iniciar um instante
+        # depois — o carregador fica "carregando" apesar do reset.
+        self._abort_pending_start_reason: "Reason | None" = None
+
+        # Reentrância de _flush_offline_queue: send_meter_values_loop
+        # tenta esvaziar a fila a cada ciclo (oportunista) E
+        # run_reconnect_sequence também chama no reconnect — se um flush
+        # demorado (item lento/timeout) ainda estiver rodando quando o
+        # próximo gatilho disparar, duas chamadas concorrentes podem
+        # entrelaçar o envio das mensagens fora de ordem. Ver
+        # _flush_offline_queue.
+        self._flush_in_progress: bool = False
+
     def _try_begin_start(self) -> bool:
         """
         Tenta reservar "iniciando sessão" de forma atômica (sem await
@@ -639,60 +660,100 @@ class EVChargerSim(BaseChargePoint):
         chegar aqui, um reenvio no próximo flush pode duplicar essa
         mensagem do lado do servidor.
         """
+        if self._flush_in_progress:
+            # send_meter_values_loop tenta esvaziar a fila a cada ciclo
+            # (oportunista) e run_reconnect_sequence também chama no
+            # reconnect — se um flush anterior ainda estiver rodando
+            # (ex.: um item lento perto do call_timeout_seconds), uma
+            # segunda chamada concorrente poderia pegar itens novos
+            # enfileirados nesse meio tempo e mandá-los ANTES dos itens
+            # mais antigos ainda em trânsito no primeiro flush — quebra
+            # a ordem que esta função promete manter. Só pula; o próximo
+            # ciclo tenta de novo.
+            self.log.debug("[FILA OFFLINE] flush já em andamento — pulando chamada concorrente.")
+            return
+
         state = self.state
         if not state.offline_queue:
             return
 
-        queue = state.offline_queue
-        state.offline_queue = []  # o que não for entregue volta pro final, abaixo
-        self.log.info(
-            f"[FILA OFFLINE] reconectado — reenviando {len(queue)} mensagem(ns) pendente(s)..."
-        )
-        local_to_real: dict[int, int] = {}
+        self._flush_in_progress = True
+        try:
+            queue = state.offline_queue
+            state.offline_queue = []  # o que não for entregue volta pro final, abaixo
+            self.log.info(
+                f"[FILA OFFLINE] reconectado — reenviando {len(queue)} mensagem(ns) pendente(s)..."
+            )
+            local_to_real: dict[int, int] = {}
 
-        for i, item in enumerate(queue):
-            kind, request, local_tx_id = item["kind"], item["request"], item["local_tx_id"]
+            for i, item in enumerate(queue):
+                kind, request, local_tx_id = item["kind"], item["request"], item["local_tx_id"]
 
-            # Corrige a referência de ID local -> real antes de enviar,
-            # se já resolvida por um StartTransaction anterior nesta
-            # mesma rodada de flush.
-            if kind == "StopTransaction" and local_tx_id in local_to_real:
-                request.transaction_id = local_to_real[local_tx_id]
+                # Corrige a referência de ID local -> real antes de enviar,
+                # se já resolvida por um StartTransaction anterior nesta
+                # mesma rodada de flush.
+                if kind == "StopTransaction" and local_tx_id in local_to_real:
+                    request.transaction_id = local_to_real[local_tx_id]
 
-            try:
-                response = await asyncio.wait_for(
-                    self.call(request), timeout=self.config.call_timeout_seconds
-                )
-            except (websockets.exceptions.ConnectionClosed, OSError, asyncio.TimeoutError) as exc:
-                self.log.warning(
-                    f"[FILA OFFLINE] conexão caiu de novo durante o flush ({exc!r}) — "
-                    f"{len(queue) - i} mensagem(ns) voltam para a fila."
-                )
-                self.is_online = False
-                state.offline_queue = queue[i:]  # este item + os que nem tentamos
-                return
-
-            self.log.info(f"[FILA OFFLINE] '{kind}' entregue com sucesso.")
-
-            if kind == "StartTransaction" and local_tx_id is not None and response is not None:
-                real_id = response.transaction_id
-                local_to_real[local_tx_id] = real_id
-                if state.active_transaction_id == local_tx_id:
-                    state.active_transaction_id = real_id
-                self.log.info(
-                    f"[FILA OFFLINE] ID local {local_tx_id} resolvido para "
-                    f"transaction_id real {real_id}"
-                )
-                if not self._start_transaction_authorized(response):
-                    tag_status = response.id_tag_info.get("status")
-                    self.log.warning(
-                        f"[FILA OFFLINE] StartTransaction confirmado mas "
-                        f"id_tag_info.status={tag_status} — abortando a sessão "
-                        "que já rodava offline, StopTransaction imediato."
+                try:
+                    response = await asyncio.wait_for(
+                        self.call(request), timeout=self.config.call_timeout_seconds
                     )
-                    asyncio.create_task(self._send_stop_transaction(real_id, reason=Reason.other))
+                except asyncio.TimeoutError:
+                    # A mensagem SAIU e o socket pode muito bem seguir de
+                    # pé — um timeout aqui NÃO prova que a conexão caiu
+                    # (mesmo raciocínio de _call_or_queue). Diferente do
+                    # ConnectionClosed abaixo, deliberadamente NÃO marca
+                    # is_online=False por causa disso: fazer isso deixaria
+                    # o simulador "preso" acreditando estar offline pra
+                    # sempre mesmo com o socket saudável, já que nada mais
+                    # detectaria essa queda que nunca aconteceu (o listener
+                    # central — cp.start() — segue lendo normalmente).
+                    # Também não reenfileira este item — seria o mesmo
+                    # risco de duplicar já corrigido em _call_or_queue.
+                    # Loga como ERROR (merece atenção manual) e segue pro
+                    # próximo item, em vez de abortar o resto do flush por
+                    # causa de UM item incerto.
+                    self.log.error(
+                        f"[FILA OFFLINE] '{kind}' sem resposta do CSMS em "
+                        f"{self.config.call_timeout_seconds}s durante o flush "
+                        "— conexão segue online, então NÃO reenfileirando "
+                        "(evita duplicar) e seguindo para o próximo item. "
+                        "Verifique manualmente se o CSMS recebeu esta mensagem."
+                    )
+                    continue
+                except (websockets.exceptions.ConnectionClosed, OSError) as exc:
+                    self.log.warning(
+                        f"[FILA OFFLINE] conexão caiu de novo durante o flush ({exc!r}) — "
+                        f"{len(queue) - i} mensagem(ns) voltam para a fila."
+                    )
+                    self.is_online = False
+                    state.offline_queue = queue[i:]  # este item + os que nem tentamos
+                    return
 
-        self.log.info("[FILA OFFLINE] todas as mensagens pendentes foram entregues.")
+                self.log.info(f"[FILA OFFLINE] '{kind}' entregue com sucesso.")
+
+                if kind == "StartTransaction" and local_tx_id is not None and response is not None:
+                    real_id = response.transaction_id
+                    local_to_real[local_tx_id] = real_id
+                    if state.active_transaction_id == local_tx_id:
+                        state.active_transaction_id = real_id
+                    self.log.info(
+                        f"[FILA OFFLINE] ID local {local_tx_id} resolvido para "
+                        f"transaction_id real {real_id}"
+                    )
+                    if not self._start_transaction_authorized(response):
+                        tag_status = response.id_tag_info.get("status")
+                        self.log.warning(
+                            f"[FILA OFFLINE] StartTransaction confirmado mas "
+                            f"id_tag_info.status={tag_status} — abortando a sessão "
+                            "que já rodava offline, StopTransaction imediato."
+                        )
+                        asyncio.create_task(self._send_stop_transaction(real_id, reason=Reason.other))
+
+            self.log.info("[FILA OFFLINE] todas as mensagens pendentes foram entregues.")
+        finally:
+            self._flush_in_progress = False
 
     def _apply_offered_amps(self, offered_amps: float, source: str):
         """
@@ -871,11 +932,20 @@ class EVChargerSim(BaseChargePoint):
         state = self.state
 
         if type == AvailabilityType.inoperative:
-            if state.active_transaction_id is not None:
+            if state.active_transaction_id is not None or self._start_in_progress:
+                # _start_in_progress cobre o mesmo instante que o Reset
+                # trata (ver on_reset/_abort_pending_start_reason): um
+                # start aceito mas ainda sem active_transaction_id
+                # gravado. Aqui não precisa de um sinal de abort à parte
+                # — quando a sessão resolver e active_transaction_id for
+                # gravado, o mecanismo normal de "Scheduled" já aplica o
+                # Inoperative no fim dela, então só tratar como sessão
+                # ativa já resolve.
                 state.pending_availability_change = "Inoperative"
                 self.log.info(
-                    "[CHANGE AVAILABILITY] sessão ativa — mudança para "
-                    "Inoperative agendada para quando a sessão terminar."
+                    "[CHANGE AVAILABILITY] sessão ativa (ou iniciando) — "
+                    "mudança para Inoperative agendada para quando a "
+                    "sessão terminar."
                 )
                 return call_result.ChangeAvailability(status=AvailabilityStatus.scheduled)
 
@@ -910,6 +980,19 @@ class EVChargerSim(BaseChargePoint):
                 f"interrompida pelo reset"
             )
             asyncio.create_task(self._handle_reset_flow(active_id, reason, is_hard))
+        elif self._start_in_progress:
+            # Um start foi aceito e está a caminho, mas
+            # active_transaction_id ainda não foi gravado — não há nada
+            # pra _handle_reset_flow parar ainda. Sinaliza pra
+            # _send_start_transaction encerrar a sessão assim que ela
+            # resolver, em vez de deixá-la completar e ir pra Charging
+            # como se o reset nunca tivesse acontecido.
+            self.log.info(
+                "[RESET] início de sessão em andamento (ainda sem "
+                "confirmação) — será encerrada assim que resolver."
+            )
+            self._abort_pending_start_reason = reason
+            asyncio.create_task(self._handle_reset_flow(None, reason, is_hard))
         else:
             asyncio.create_task(self._handle_reset_flow(None, reason, is_hard))
 
@@ -1448,6 +1531,24 @@ class EVChargerSim(BaseChargePoint):
                 state.reservation_id = None
                 state.reserved_for_id_tag = None
                 state.reserved_parent_id_tag = None
+
+            if self._abort_pending_start_reason is not None:
+                # on_reset chegou enquanto esta sessão ainda não tinha
+                # active_transaction_id gravado — o guard normal dele não
+                # viu nada pra parar na hora, então sinalizou aqui.
+                # active_transaction_id já está resolvido agora (real ou
+                # placeholder local), então dá pra encerrar de verdade.
+                abort_reason = self._abort_pending_start_reason
+                self._abort_pending_start_reason = None
+                self.log.warning(
+                    f"[START TRANSACTION] reset foi pedido enquanto esta "
+                    f"sessão ainda não tinha confirmado — encerrando "
+                    f"imediatamente (transaction_id={state.active_transaction_id})."
+                )
+                asyncio.create_task(
+                    self._send_stop_transaction(state.active_transaction_id, reason=abort_reason)
+                )
+                return
 
             # O CSMS real já manda um SetChargingProfile logo após o
             # boot — não precisamos de um "chute" além do já aplicado acima.
