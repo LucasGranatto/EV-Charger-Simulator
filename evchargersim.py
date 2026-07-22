@@ -26,7 +26,7 @@ queda real.
 
 Comandos de console: digite "help" com o simulador rodando pra ver a
 lista completa (start/stop/pause/resume/fault/clear/datatransfer/
-queue/authcache/disconnect).
+queue/authcache/locallist/disconnect).
 """
 
 import argparse
@@ -2054,6 +2054,16 @@ class EVChargerSim(BaseChargePoint):
                     expiry = entry.get("expiry_date") or "sem validade"
                     self.log.info(f"[CONSOLE]   {tag} -> {entry.get('status')} (expira: {expiry})")
 
+            # ── locallist — inspeciona a lista local (SendLocalList) ──
+            elif cmd == "locallist":
+                n = len(state.local_auth_list)
+                self.log.info(
+                    f"[CONSOLE] lista local (SendLocalList): versão="
+                    f"{state.local_list_version} | {n} entrada(s)"
+                )
+                for tag, status in state.local_auth_list.items():
+                    self.log.info(f"[CONSOLE]   {tag} -> {status}")
+
             # ── disconnect — derruba a conexão de propósito (chaos manual) ──
             elif cmd == "disconnect":
                 if not self.is_online or self._connection is None:
@@ -2076,6 +2086,7 @@ class EVChargerSim(BaseChargePoint):
                     "                   — envia DataTransfer para o CSMS\n"
                     "  queue            — mostra a fila offline e o status de conectividade\n"
                     "  authcache        — mostra o estado/entradas da authorization cache\n"
+                    "  locallist        — mostra a versão/entradas da lista local (SendLocalList)\n"
                     "  disconnect       — derruba a conexão de propósito (teste de rede)\n"
                     "  help             — esta mensagem\n"
                     "\n"
