@@ -26,7 +26,7 @@ queda real.
 
 Comandos de console: digite "help" com o simulador rodando pra ver a
 lista completa (start/stop/pause/resume/fault/clear/datatransfer/
-queue/disconnect).
+queue/authcache/disconnect).
 """
 
 import argparse
@@ -253,6 +253,14 @@ class ChargerState:
     # Se presente, o start local usa esse status sem chamar Authorize.
     local_auth_list: dict = field(default_factory=dict)
     local_list_version: int = 0
+
+    # ── Authorization Cache: conceitualmente separada do LocalList acima
+    # — aqui é o PRÓPRIO charger guardando id_tag_info de Authorize.conf
+    # já vistos, pra sobreviver offline sem depender do CSMS ter mandado
+    # SendLocalList. Chave: id_tag -> {"status", "expiry_date", "parent_id_tag"}.
+    # Controlado por ChangeConfiguration(AuthorizationCacheEnabled).
+    auth_cache: dict = field(default_factory=dict)
+    auth_cache_enabled: bool = True
 
     # ── Disponibilidade (ChangeAvailability): "Operative"/"Inoperative".
     availability_status: str = "Operative"
@@ -1075,6 +1083,8 @@ class EVChargerSim(BaseChargePoint):
             {"key": "LocalAuthListEnabled", "readonly": False, "value": "true"},
             {"key": "LocalAuthListMaxLength", "readonly": True, "value": "100"},
             {"key": "SendLocalListMaxLength", "readonly": True, "value": "20"},
+            {"key": "AuthorizationCacheEnabled", "readonly": False,
+             "value": "true" if self.state.auth_cache_enabled else "false"},
             {"key": "ReserveConnectorZeroSupported", "readonly": True, "value": "false"},
             {"key": "AvailabilityStatus", "readonly": True,
              "value": self.state.availability_status},
@@ -1102,6 +1112,16 @@ class EVChargerSim(BaseChargePoint):
             except ValueError:
                 self.log.warning(f"[CHANGE CONFIGURATION] valor inválido para HeartbeatInterval: {value}")
                 return call_result.ChangeConfiguration(status="Rejected")
+        elif key == "AuthorizationCacheEnabled":
+            enabled = str(value).strip().lower() in ("true", "1", "yes")
+            self.state.auth_cache_enabled = enabled
+            self.log.info(
+                f"[AUTH CACHE] {'habilitada' if enabled else 'desabilitada'} via "
+                "ChangeConfiguration."
+            )
+            # Desabilitar não apaga entradas já guardadas (comportamento
+            # comum em charger real: religar depois volta a valer o que
+            # já tinha) — só ClearCache realmente esvazia o dicionário.
         # Outras chaves são aceitas mas sem efeito simulado (ex:
         # MeterValueSampleInterval é fixo via config no boot).
 
@@ -1334,15 +1354,13 @@ class EVChargerSim(BaseChargePoint):
     @on(Action.clear_cache)
     async def on_clear_cache(self, **kwargs):
         """
-        Limpa a Authorization Cache — que no protocolo é conceitualmente
-        separada da lista local de autorização (local_auth_list, gerida
-        por SendLocalList/GetLocalListVersion). Este simulador não mantém
-        um cache de Authorize.conf à parte hoje, então não há estado pra
-        limpar aqui; ainda assim expõe o handler (em vez de deixar cair
-        no NotImplemented padrão da lib) porque ClearCache é uma das
-        chamadas CSMS->CP mais comumente testadas.
+        Limpa a Authorization Cache — conceitualmente separada da lista
+        local de autorização (local_auth_list, gerida por SendLocalList/
+        GetLocalListVersion, que ClearCache NÃO afeta).
         """
-        self.log.info("[CLEAR CACHE] solicitado pelo CSMS — nenhum cache de autorização separado para limpar.")
+        n = len(self.state.auth_cache)
+        self.state.auth_cache.clear()
+        self.log.info(f"[CLEAR CACHE] authorization cache limpa ({n} entrada(s) removida(s)).")
         return call_result.ClearCache(status=ClearCacheStatus.accepted)
 
     # --------------------------------------------------------
@@ -2024,6 +2042,18 @@ class EVChargerSim(BaseChargePoint):
                     f"[CONSOLE] conectividade: {'online' if self.is_online else 'OFFLINE'}"
                 )
 
+            # ── authcache — inspeciona a Authorization Cache local ──
+            elif cmd == "authcache":
+                enabled = state.auth_cache_enabled
+                n = len(state.auth_cache)
+                self.log.info(
+                    f"[CONSOLE] authorization cache: "
+                    f"{'habilitada' if enabled else 'DESABILITADA'} | {n} entrada(s)"
+                )
+                for tag, entry in state.auth_cache.items():
+                    expiry = entry.get("expiry_date") or "sem validade"
+                    self.log.info(f"[CONSOLE]   {tag} -> {entry.get('status')} (expira: {expiry})")
+
             # ── disconnect — derruba a conexão de propósito (chaos manual) ──
             elif cmd == "disconnect":
                 if not self.is_online or self._connection is None:
@@ -2045,25 +2075,75 @@ class EVChargerSim(BaseChargePoint):
                     "  datatransfer <vendor_id> [message_id] [data]\n"
                     "                   — envia DataTransfer para o CSMS\n"
                     "  queue            — mostra a fila offline e o status de conectividade\n"
+                    "  authcache        — mostra o estado/entradas da authorization cache\n"
                     "  disconnect       — derruba a conexão de propósito (teste de rede)\n"
                     "  help             — esta mensagem\n"
                     "\n"
-                    "  Reserva (ReserveNow/CancelReservation) e lista local "
-                    "(SendLocalList) são\n"
-                    "  controladas pelo CSMS — 'start' respeita ambas automaticamente.\n"
+                    "  Reserva (ReserveNow/CancelReservation), lista local "
+                    "(SendLocalList) e a\n"
+                    "  authorization cache (Authorize.conf guardado, usado "
+                    "offline) são\n"
+                    "  controladas pelo CSMS — 'start' respeita todas automaticamente.\n"
                     "  Offline, mensagens (StatusNotification/MeterValues/Start·StopTransaction)\n"
                     "  são enfileiradas e reenviadas automaticamente ao reconectar."
                 )
             elif cmd:
                 self.log.warning(f"[CONSOLE] Comando desconhecido: '{cmd}'. Digite 'help'.")
 
+    def _cache_auth_result(self, id_tag: str, id_tag_info: dict):
+        """
+        Guarda o resultado de um Authorize.conf na Authorization Cache
+        (se habilitada) — permite autorizar esse mesmo id_tag localmente
+        numa próxima queda de conexão, sem depender do CSMS ter mandado
+        esse id_tag via SendLocalList. Conceitualmente separada da lista
+        local: aqui é o PRÓPRIO charger "lembrando" respostas passadas.
+        """
+        if not self.state.auth_cache_enabled:
+            return
+        self.state.auth_cache[id_tag] = {
+            "status": id_tag_info.get("status", "Invalid"),
+            "expiry_date": id_tag_info.get("expiry_date") or id_tag_info.get("expiryDate"),
+            "parent_id_tag": id_tag_info.get("parent_id_tag") or id_tag_info.get("parentIdTag"),
+        }
+
+    def _lookup_auth_cache(self, id_tag: str) -> str | None:
+        """
+        Consulta a Authorization Cache pra um id_tag, respeitando
+        expiryDate quando presente. Retorna None se não encontrado,
+        expirado, ou se o cache está desabilitado — quem chamou trata
+        isso como "sem informação disponível", não como Invalid.
+        """
+        if not self.state.auth_cache_enabled:
+            return None
+        entry = self.state.auth_cache.get(id_tag)
+        if entry is None:
+            return None
+        expiry_date = entry.get("expiry_date")
+        if expiry_date:
+            try:
+                expiry_dt = datetime.fromisoformat(str(expiry_date).replace("Z", "+00:00"))
+                if datetime.now(timezone.utc) >= expiry_dt:
+                    self.log.info(
+                        f"[AUTH CACHE] entrada de id_tag='{id_tag}' expirada "
+                        f"({expiry_date}) — descartando."
+                    )
+                    self.state.auth_cache.pop(id_tag, None)
+                    return None
+            except ValueError:
+                pass  # expiryDate malformado — trata como sem expiração
+        return entry.get("status")
+
     async def _local_start_flow(self, connector_id: int, id_tag: str):
         """
         Start local (RFID no totem) — diferente do RemoteStart, precisa
-        autorizar o id_tag antes de iniciar. Se estiver na lista local
-        (SendLocalList), usa o status de lá direto, sem round-trip ao
-        CSMS. Senão cai no Authorize remoto — e se estivermos offline
-        nesse caso, recusa direto (Authorize precisa de resposta
+        autorizar o id_tag antes de iniciar. Ordem de resolução (igual a
+        um charger real):
+          1) lista local (SendLocalList) — sem round-trip nenhum;
+          2) online — Authorize direto ao CSMS, sempre (é a fonte de
+             verdade); a resposta também alimenta a Authorization Cache
+             pra uso futuro offline;
+          3) offline — cai pra Authorization Cache, se habilitada;
+        sem nenhuma das três, recusa (Authorize precisa de resposta
         síncrona, não dá pra enfileirar).
         """
         try:
@@ -2074,14 +2154,7 @@ class EVChargerSim(BaseChargePoint):
                     f"[LOCAL START] id_tag='{id_tag}' encontrado na lista local "
                     f"(status={status}) — sem chamada Authorize ao CSMS."
                 )
-            elif not self.is_online:
-                self.log.warning(
-                    f"[LOCAL START] offline e id_tag='{id_tag}' não está na "
-                    "lista local — não é possível autorizar sem conexão. "
-                    "Sessão não iniciada."
-                )
-                return
-            else:
+            elif self.is_online:
                 auth_request = call.Authorize(id_tag=id_tag)
                 auth_response = await self._call_or_queue(
                     auth_request, kind="Authorize", queueable=False
@@ -2093,6 +2166,21 @@ class EVChargerSim(BaseChargePoint):
                     )
                     return
                 status = auth_response.id_tag_info.get("status", "Invalid")
+                self._cache_auth_result(id_tag, auth_response.id_tag_info)
+            else:
+                cached_status = self._lookup_auth_cache(id_tag)
+                if cached_status is None:
+                    self.log.warning(
+                        f"[LOCAL START] offline e id_tag='{id_tag}' não está "
+                        "na lista local nem na authorization cache — não é "
+                        "possível autorizar sem conexão. Sessão não iniciada."
+                    )
+                    return
+                status = cached_status
+                self.log.info(
+                    f"[LOCAL START] offline — id_tag='{id_tag}' autorizado "
+                    f"via authorization cache (status={status})."
+                )
 
             if status != AuthorizationStatus.accepted:
                 self.log.warning(
